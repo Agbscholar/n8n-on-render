@@ -1,13 +1,6 @@
-# Use official n8n image
-FROM n8nio/n8n:latest
+FROM n8nio/n8n
 
-# (Optional) Install ffmpeg if you plan to process audio/video in n8n
+# Install ffmpeg on Alpine
 USER root
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ffmpeg
 USER node
-
-# Copy the start script into the image
-COPY --chown=node:node start.sh /start.sh
-
-# Run the script at container start
-CMD ["sh", "/start.sh"]
