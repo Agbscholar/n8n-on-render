@@ -11,55 +11,120 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {polling: true});
 app.use(express.json());
 app.use('/webhook', express.raw({type: 'application/json'}));
 
+// Deduplication cache
+const processingCache = new Map();
+const MESSAGE_TIMEOUT = 30000; // 30 seconds
 
-bot.on('message', async (msg) => {
-  if (msg.text && (msg.text.includes('youtube.com') || msg.text.includes('youtu.be') || 
-                   msg.text.includes('tiktok.com') || msg.text.includes('instagram.com'))) {
+// Unified video processing handler
+async function handleVideoProcessing(msg, url) {
+  const chatId = msg.chat.id;
+  const telegramId = msg.from.id;
+  
+  // Deduplication check
+  const cacheKey = `${telegramId}:${url}`;
+  if (processingCache.has(cacheKey)) {
+    const cached = processingCache.get(cacheKey);
+    if (Date.now() - cached.timestamp < MESSAGE_TIMEOUT) {
+      console.log('⚠️ Duplicate request ignored:', cacheKey);
+      return null;
+    }
+  }
+  
+  processingCache.set(cacheKey, { timestamp: Date.now() });
+  
+  try {
+    // Check if user can use service
+    const canUse = await db.canUseService(telegramId);
     
-    const chatId = msg.chat.id;
-    const telegramId = msg.from.id;
-    const url = msg.text;
-    
-    try {
-      // Check if user can use service
-      const canUse = await db.canUseService(telegramId);
+    if (!canUse) {
+      const limitMessage = `
+🚫 **Daily limit reached!**
+
+You've used your 3 free videos today.
+
+💎 **Upgrade to Premium for:**
+- ✅ Unlimited videos
+- ✅ Priority processing  
+- ✅ All platforms
+- ✅ Custom lengths
+
+Ready to upgrade? /upgrade
+      `;
       
-      if (!canUse) {
-        // ... (existing limit handling code)
-        return;
-      }
-
-      // Get user data
-      const userData = await db.getUser(telegramId);
+      const keyboard = {
+        inline_keyboard: [
+          [{text: '💎 Upgrade Now - $2.99', callback_data: 'upgrade_premium'}]
+        ]
+      };
       
-      // Check platform restrictions for free users
-      if (userData.subscription_type === 'free' && url.includes('instagram.com')) {
-        return bot.sendMessage(chatId, 
-          '🔒 **Instagram is Premium only!**\n\n💎 Upgrade to access Instagram: /upgrade'
-        );
-      }
-
-      // Send processing message
-      const processingMsg = await bot.sendMessage(chatId, 
-        '🎬 Processing your video... This may take 1-3 minutes.\n\n⏳ Please wait...'
-      );
-
-      // Trigger n8n workflow
-      const processingData = await n8nClient.triggerVideoProcessing({
-        telegram_id: telegramId,
-        chat_id: chatId,
-        subscription_type: userData.subscription_type,
-        first_name: userData.first_name
-      }, url);
-
-      // Update database with processing start
-      await db.logProcessingStart(telegramId, {
-        url: url,
-        platform: url.includes('youtube') ? 'YouTube' : 
-                 url.includes('tiktok') ? 'TikTok' : 'Instagram',
-        processing_id: processingData.processing_id
+      await bot.sendMessage(chatId, limitMessage, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard
       });
+      return null;
+    }
 
+    // Get user data
+    const userData = await db.getUser(telegramId);
+    
+    // Check platform restrictions for free users
+    if (userData.subscription_type === 'free' && url.includes('instagram.com')) {
+      await bot.sendMessage(chatId, 
+        '🔒 **Instagram is Premium only!**\n\n💎 Upgrade to access Instagram: /upgrade',
+        { parse_mode: 'Markdown' }
+      );
+      return null;
+    }
+
+    // Send single processing message
+    const processingMsg = await bot.sendMessage(chatId, 
+      '🎬 Processing your video... This may take 1-3 minutes.\n\n⏳ Please wait...'
+    );
+
+    // Trigger n8n workflow
+    const processingData = await n8nClient.triggerVideoProcessing({
+      telegram_id: telegramId,
+      chat_id: chatId,
+      subscription_type: userData.subscription_type,
+      first_name: userData.first_name
+    }, url);
+
+    // Update database with processing start
+    await db.logProcessingStart(telegramId, {
+      url: url,
+      platform: url.includes('youtube') ? 'YouTube' : 
+               url.includes('tiktok') ? 'TikTok' : 'Instagram',
+      processing_id: processingData.processing_id
+    });
+
+    return { processingMsg, processingData, chatId, telegramId };
+    
+  } catch (error) {
+    console.error('Video processing error:', error);
+    await bot.sendMessage(chatId, '❌ An error occurred. Please try again later.');
+    return null;
+  }
+}
+
+// Single message handler for video URLs
+bot.on('message', async (msg) => {
+  if (!msg.text) return;
+  
+  const urlPatterns = [
+    'youtube.com',
+    'youtu.be', 
+    'tiktok.com',
+    'instagram.com'
+  ];
+  
+  const hasVideoUrl = urlPatterns.some(pattern => msg.text.includes(pattern));
+  
+  if (hasVideoUrl) {
+    const result = await handleVideoProcessing(msg, msg.text);
+    
+    if (result) {
+      const { processingMsg, processingData, chatId, telegramId } = result;
+      
       // Monitor processing status
       let attempts = 0;
       const maxAttempts = 60; // 5 minutes max
@@ -97,22 +162,18 @@ bot.on('message', async (msg) => {
           );
         }
       }, 5000); // Check every 5 seconds
-
-    } catch (error) {
-      console.error('Video processing error:', error);
-      bot.sendMessage(chatId, '❌ An error occurred. Please try again later.');
     }
   }
 });
 
 // Webhook endpoint for n8n callbacks
 app.post('/webhook/n8n-callback', express.json(), async (req, res) => {
-  const { processing_id, status, telegram_id, chat_id, shorts_data, error } = req.body;
+  const { processing_id, status, telegram_id, chat_id, shorts_results, total_shorts, error } = req.body;
   
   try {
-    if (status === 'completed' && shorts_data) {
+    if (status === 'completed' && shorts_results) {
       // Send video files to user
-      for (const short of shorts_data) {
+      for (const short of shorts_results) {
         await bot.sendVideo(chat_id, short.file_url, {
           caption: `📹 ${short.title}\n\n🤖 Created by @your_bot_username`
         });
@@ -121,7 +182,7 @@ app.post('/webhook/n8n-callback', express.json(), async (req, res) => {
       // Log successful completion
       await db.logProcessingComplete(telegram_id, {
         processing_id,
-        shorts_count: shorts_data.length,
+        shorts_count: shorts_results.length,
         status: 'completed'
       });
       
@@ -132,6 +193,10 @@ app.post('/webhook/n8n-callback', express.json(), async (req, res) => {
         status: 'error',
         error_message: error
       });
+      
+      await bot.sendMessage(chat_id, 
+        '❌ Processing failed. Please try with a different video URL.'
+      );
     }
     
     res.json({ received: true });
@@ -140,7 +205,6 @@ app.post('/webhook/n8n-callback', express.json(), async (req, res) => {
     res.status(500).json({ error: 'Webhook processing failed' });
   }
 });
-
 
 // Start command with business messaging
 bot.onText(/\/start/, async (msg) => {
@@ -257,63 +321,15 @@ ${userData.subscription_type === 'free' ?
   bot.sendMessage(msg.chat.id, statsMessage, {parse_mode: 'Markdown'});
 });
 
-// Handle video URLs with business logic
-bot.on('message', async (msg) => {
-  if (msg.text && (msg.text.includes('youtube.com') || msg.text.includes('youtu.be') || 
-                   msg.text.includes('tiktok.com') || msg.text.includes('instagram.com'))) {
-    
-    const chatId = msg.chat.id;
-    const telegramId = msg.from.id;
-    const url = msg.text;
-    
-    // Check if user can use service
-    const canUse = await db.canUseService(telegramId);
-    
-    if (!canUse) {
-      const limitMessage = `
-🚫 **Daily limit reached!**
-
-You've used your 3 free videos today.
-
-💎 **Upgrade to Premium for:**
-- ✅ Unlimited videos
-- ✅ Priority processing  
-- ✅ All platforms
-- ✅ Custom lengths
-
-Ready to upgrade? /upgrade
-      `;
-      
-      const keyboard = {
-        inline_keyboard: [
-          [{text: '💎 Upgrade Now - $2.99', callback_data: 'upgrade_premium'}]
-        ]
-      };
-      
-      return bot.sendMessage(chatId, limitMessage, {
-        parse_mode: 'Markdown',
-        reply_markup: keyboard
-      });
+// Clean cache periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of processingCache.entries()) {
+    if (now - value.timestamp > MESSAGE_TIMEOUT) {
+      processingCache.delete(key);
     }
-    
-    // Process the video (integrate with your n8n workflow)
-    bot.sendMessage(chatId, '🎬 Processing your video... This may take 1-3 minutes.');
-    
-    // Here you would trigger your n8n workflow
-    // For now, simulate processing
-    setTimeout(async () => {
-      await db.logUsage(telegramId, {
-        url: url,
-        platform: url.includes('youtube') ? 'YouTube' : 'TikTok',
-        status: 'success',
-        shorts_created: 2,
-        processing_time: 45
-      });
-      
-      bot.sendMessage(chatId, '✅ Your shorts are ready! Check messages above.');
-    }, 2000);
   }
-});
+}, 60000); // Clean every minute
 
 // Stripe webhook handler
 app.post('/webhook', payment.handleWebhook);
