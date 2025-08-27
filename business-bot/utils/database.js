@@ -23,7 +23,6 @@ class Database {
       )
     `);
 
-
     // Usage logs table
     this.db.run(`
       CREATE TABLE IF NOT EXISTS usage_logs (

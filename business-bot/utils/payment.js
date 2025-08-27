@@ -19,7 +19,7 @@ class PaymentHandler {
       tx_ref: `${telegramId}_${plan}_${Date.now()}`,
       amount: planPrice.amount,
       currency: planPrice.currency,
-      redirect_url: `https://t.me/your_bot_username?start=success`,
+      redirect_url: `https://t.me/Osezblessed?start=success`,
       payment_options: 'card,banktransfer,ussd',
       customer: {
         email: `user${telegramId}@videoshortsbot.com`,
@@ -108,23 +108,23 @@ class PaymentHandler {
 💰 **NIGERIAN PRICING** 🇳🇬
 
 💎 **Premium - ₦1,200/month**
-- Unlimited video processing
-- All platforms (Instagram, Twitter)
-- Priority processing
-- Custom video lengths
+• Unlimited video processing
+• All platforms (Instagram, Twitter)
+• Priority processing
+• Custom video lengths
 
 🚀 **Pro - ₦4,000/month**
-- Everything in Premium  
-- API access
-- White-label rights
-- Custom branding
-- Reseller opportunities
+• Everything in Premium  
+• API access
+• White-label rights
+• Custom branding
+• Reseller opportunities
 
 💳 **Payment Methods:**
-- Debit Card (Visa, Mastercard)
-- Bank Transfer
-- USSD Code
-- Mobile Money
+• Debit Card (Visa, Mastercard)
+• Bank Transfer
+• USSD Code
+• Mobile Money
     `;
   }
 }
