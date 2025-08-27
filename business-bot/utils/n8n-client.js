@@ -2,7 +2,7 @@ const axios = require('axios');
 
 class N8nClient {
   constructor() {
-    this.n8nBaseUrl = process.env.N8N_BASE_URL || 'https://your-n8n-service.onrender.com';
+    this.n8nBaseUrl = process.env.N8N_BASE_URL || 'https://n8n-on-render-wf30.onrender.com/';
     this.webhookSecret = process.env.N8N_WEBHOOK_SECRET || 'your-secret-key';
   }
 
