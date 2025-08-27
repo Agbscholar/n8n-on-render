@@ -220,7 +220,7 @@ Choose your plan:
     inline_keyboard: [
       [{text: '💎 Get Premium - ₦1,200', url: premiumUrl}],
       [{text: '🚀 Get Pro - ₦4,000', url: proUrl}],
-      [{text: '❓ Contact Support', url: 'https://t.me/your_support_username'}]
+      [{text: '❓ Contact Support', url: 'https://t.me/Osezblessed'}]
     ]
   };
   
