@@ -106,7 +106,7 @@ bot.on('message', async (msg) => {
 });
 
 // Webhook endpoint for n8n callbacks
-app.post('/webhook/n8n-callback', express.json(), async (req, res) => {
+app.post('/webhook/video-processing express.json(), async (req, res) => {
   const { processing_id, status, telegram_id, chat_id, shorts_data, error } = req.body;
   
   try {
