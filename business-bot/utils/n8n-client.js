@@ -33,6 +33,7 @@ class N8nClient {
         }
       );
 
+
       return response.data;
     } catch (error) {
       console.error('n8n trigger error:', error.response?.data || error.message);
