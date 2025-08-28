@@ -1,5 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
+const axios = require('axios'); // Added axios for better HTTP requests
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 
@@ -22,6 +23,7 @@ let users = new Map();
 
 // Middleware
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Test the bot connection
 bot.getMe().then((botInfo) => {
@@ -209,34 +211,43 @@ Ready to upgrade? /upgrade`;
         userData.total_usage = (userData.total_usage || 0) + 1;
         users.set(userId, userData);
         
-        // Call N8N webhook to process video
+        // Call N8N webhook to process video using axios
         try {
-            const n8nResponse = await fetch('https://n8n-on-render-wf30.onrender.com/webhook/video-processing', {
-                method: 'POST',
+            const n8nWebhookUrl = process.env.N8N_WEBHOOK_URL || 'https://n8n-on-render-wf30.onrender.com/webhook/video-processing';
+            const webhookSecret = process.env.N8N_WEBHOOK_SECRET || '7f9d0d2e8a6f4f38a13a2bcf5b6d441b91c9d26e8b72714d2edcf7c4e2a843ke';
+            const businessBotUrl = process.env.BUSINESS_BOT_URL || 'https://video-shorts-business-bot.onrender.com';
+            
+            console.log('🔄 Calling N8N webhook:', n8nWebhookUrl);
+            
+            const payload = {
+                webhook_secret: webhookSecret,
+                telegram_id: userId,
+                chat_id: chatId,
+                video_url: msg.text,
+                user_name: msg.from.first_name,
+                subscription_type: userData.subscription_type || 'free',
+                user_limits: { max_shorts: 3 },
+                business_bot_url: businessBotUrl
+            };
+            
+            console.log('📤 Sending payload to N8N:', JSON.stringify(payload, null, 2));
+            
+            const n8nResponse = await axios.post(n8nWebhookUrl, payload, {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({
-                    webhook_secret: process.env.N8N_WEBHOOK_SECRET || '7f9d0d2e8a6f4f38a13a2bcf5b6d441b91c9d26e8b72714d2edcf7c4e2a843ke',
-                    telegram_id: userId,
-                    chat_id: chatId,
-                    video_url: msg.text,
-                    user_name: msg.from.first_name,
-                    subscription_type: userData.subscription_type || 'free',
-                    user_limits: { max_shorts: 3 },
-                    business_bot_url: 'https://video-shorts-business-bot.onrender.com'
-                })
+                timeout: 10000 // 10 second timeout
             });
             
-            if (n8nResponse.ok) {
-                console.log('✅ N8N webhook called successfully');
-            } else {
-                console.error('❌ N8N webhook failed:', n8nResponse.statusText);
-                throw new Error('Processing service unavailable');
-            }
+            console.log('✅ N8N webhook called successfully:', n8nResponse.data);
+            
         } catch (error) {
             console.error('❌ Error calling N8N:', error.message);
-            await bot.sendMessage(chatId, '❌ Processing failed. Please try again later or contact support.');
+            if (error.response) {
+                console.error('❌ N8N Response status:', error.response.status);
+                console.error('❌ N8N Response data:', error.response.data);
+            }
+            await bot.sendMessage(chatId, '❌ Processing failed. Please try again later or contact support.\n\nSupport: @Osezblessed');
         }
     }
 });
@@ -347,6 +358,27 @@ Contact: @Osezblessed`;
                 }
             });
             break;
+            
+        case 'back_to_start':
+            const originalMessage = `🎬 *Welcome to VideoShortsBot!*
+
+Transform long videos into viral shorts instantly!
+
+*Ready? Send me any video URL!*`;
+            
+            bot.editMessageText(originalMessage, {
+                chat_id: message.chat.id,
+                message_id: message.message_id,
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{text: '💎 Upgrade Now', callback_data: 'upgrade'}],
+                        [{text: '📊 My Stats', callback_data: 'stats'}],
+                        [{text: '❓ Help', callback_data: 'help'}]
+                    ]
+                }
+            });
+            break;
     }
     
     // Answer the callback query to remove the loading state
@@ -354,55 +386,127 @@ Contact: @Osezblessed`;
 });
 
 // Webhook endpoints for N8N callbacks
-app.post('/webhook/n8n-callback', (req, res) => {
-    console.log('📨 N8N callback received:', req.body);
+app.post('/webhook/n8n-callback', async (req, res) => {
+    console.log('📦 Received callback from N8N:', JSON.stringify(req.body, null, 2));
     
-    const { telegram_id, chat_id, status, shorts_results, total_shorts, subscription_type } = req.body;
-    
-    if (status === 'completed' && shorts_results) {
-        const results = typeof shorts_results === 'string' ? JSON.parse(shorts_results) : shorts_results;
+    try {
+        const { 
+            telegram_id, 
+            chat_id, 
+            status, 
+            shorts_results, 
+            total_shorts, 
+            subscription_type,
+            processing_completed_at,
+            usage_stats
+        } = req.body;
         
-        let message = `✅ *Your ${total_shorts} shorts are ready!*\n\n`;
-        
-        results.forEach((short, index) => {
-            message += `🎬 *Short ${index + 1}:* ${short.title}\n`;
-            message += `⏱️ Duration: ${short.duration}s\n`;
-            message += `📱 Quality: ${short.quality}\n`;
-            if (short.file_url) {
-                message += `📥 [Download](${short.file_url})\n`;
+        if (status === 'completed' && shorts_results) {
+            // Parse shorts_results if it's a string
+            const results = typeof shorts_results === 'string' ? 
+                JSON.parse(shorts_results) : shorts_results;
+            
+            let message = `✅ *Your ${total_shorts} shorts are ready!*\n\n`;
+            
+            results.forEach((short, index) => {
+                message += `🎬 *Short ${index + 1}:* ${short.title}\n`;
+                message += `⏱️ Duration: ${short.duration}s\n`;
+                message += `📱 Quality: ${short.quality}\n`;
+                
+                if (short.file_url) {
+                    message += `📥 [Download](${short.file_url})\n`;
+                }
+                if (short.thumbnail_url) {
+                    message += `🖼️ [Thumbnail](${short.thumbnail_url})\n`;
+                }
+                message += `\n`;
+            });
+            
+            if (subscription_type === 'free') {
+                message += `🚀 *Upgrade to Premium for:*\n• No watermarks\n• HD quality\n• Unlimited processing\n\n/upgrade`;
             }
-            message += `\n`;
-        });
-        
-        if (subscription_type === 'free') {
-            message += `🚀 *Upgrade to Premium for:*\n• No watermarks\n• HD quality\n• Unlimited processing\n\n/upgrade`;
+            
+            // Add processing stats if available
+            if (usage_stats) {
+                message += `\n📊 *Processing completed in ${usage_stats.processing_time}*`;
+            }
+            
+            await bot.sendMessage(chat_id, message, { 
+                parse_mode: 'Markdown',
+                disable_web_page_preview: false
+            });
+            
+            console.log('✅ Results sent to user:', telegram_id);
+            
+        } else {
+            console.log('❌ Invalid callback data received');
+            await bot.sendMessage(chat_id, '❌ Processing completed but results are unavailable. Please try again.');
         }
         
-        bot.sendMessage(chat_id, message, { parse_mode: 'Markdown' });
+        res.json({ status: 'success', message: 'Callback processed successfully' });
+        
+    } catch (error) {
+        console.error('❌ Error processing N8N callback:', error.message);
+        console.error('Full error:', error);
+        
+        // Try to send error message to user if we have chat_id
+        if (req.body.chat_id) {
+            try {
+                await bot.sendMessage(req.body.chat_id, '❌ There was an error delivering your results. Please contact support.\n\nSupport: @Osezblessed');
+            } catch (botError) {
+                console.error('❌ Failed to send error message to user:', botError.message);
+            }
+        }
+        
+        res.status(500).json({ 
+            status: 'error', 
+            message: 'Failed to process callback',
+            error: error.message 
+        });
     }
-    
-    res.json({ status: 'received' });
 });
 
-app.post('/webhook/n8n-error', (req, res) => {
-    console.log('❌ N8N error received:', req.body);
+app.post('/webhook/n8n-error', async (req, res) => {
+    console.log('❌ N8N error received:', JSON.stringify(req.body, null, 2));
     
-    const { chat_id, error_message } = req.body;
-    
-    const errorMsg = `❌ *Processing Failed*
+    try {
+        const { 
+            chat_id, 
+            telegram_id, 
+            error_message, 
+            processing_id, 
+            video_url,
+            error_type 
+        } = req.body;
+        
+        const errorMsg = `❌ *Processing Failed*
 
-*Error:* ${error_message}
+*Error:* ${error_message || 'Unknown error occurred'}
 
 🔄 *What to do:*
 • Check if the video URL is valid
 • Try again in a few minutes  
 • Contact support if issue persists
 
+📝 *Processing ID:* ${processing_id || 'N/A'}
+
 Support: @Osezblessed`;
-    
-    bot.sendMessage(chat_id, errorMsg, { parse_mode: 'Markdown' });
-    
-    res.json({ status: 'error_handled' });
+        
+        await bot.sendMessage(chat_id, errorMsg, { parse_mode: 'Markdown' });
+        
+        console.log('✅ Error notification sent to user:', telegram_id);
+        
+        res.json({ status: 'success', message: 'Error notification sent' });
+        
+    } catch (error) {
+        console.error('❌ Error handling N8N error callback:', error.message);
+        
+        res.status(500).json({ 
+            status: 'error', 
+            message: 'Failed to handle error callback',
+            error: error.message 
+        });
+    }
 });
 
 // Health check
@@ -410,7 +514,29 @@ app.get('/', (req, res) => {
     res.json({ 
         status: 'Bot is running!', 
         timestamp: new Date(),
-        bot_username: '@videoshortsaibot'
+        bot_username: '@videoshortsaibot',
+        endpoints: [
+            '/webhook/n8n-callback',
+            '/webhook/n8n-error'
+        ]
+    });
+});
+
+// Test endpoint for debugging
+app.get('/test', (req, res) => {
+    res.json({
+        environment: {
+            NODE_ENV: process.env.NODE_ENV,
+            PORT: process.env.PORT,
+            TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN ? 'Set' : 'Missing',
+            N8N_WEBHOOK_URL: process.env.N8N_WEBHOOK_URL || 'Using default',
+            N8N_WEBHOOK_SECRET: process.env.N8N_WEBHOOK_SECRET ? 'Set' : 'Using default',
+            BUSINESS_BOT_URL: process.env.BUSINESS_BOT_URL || 'Using default'
+        },
+        stats: {
+            total_users: users.size,
+            uptime: process.uptime()
+        }
     });
 });
 
@@ -420,6 +546,8 @@ app.listen(PORT, () => {
     console.log(`🚀 Bot server running on port ${PORT}`);
     console.log(`Bot username: @videoshortsaibot`);
     console.log(`Bot URL: https://video-shorts-business-bot.onrender.com`);
+    console.log(`Health check: https://video-shorts-business-bot.onrender.com/`);
+    console.log(`Test endpoint: https://video-shorts-business-bot.onrender.com/test`);
 });
 
 // Graceful shutdown
