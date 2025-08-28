@@ -1,172 +1,273 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 const multer = require('multer');
+const path = require('path');
+const fs = require('fs').promises;
+const FormData = require('form-data');
+const mime = require('mime-types');
+const cron = require('cron');
 
+// Import utilities
+const db = require('./utils/supabase');
+const logger = require('./utils/logger'); // Enhanced logging utility
+const rateLimiter = require('./middleware/rateLimiter'); // Rate limiting
+const validator = require('./utils/validator'); // Input validation
+
+// Initialize Express app and Telegram bot
 const app = express();
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {polling: true});
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
+  polling: true,
+  request: {
+    timeout: 30000,
+    retries: 3
+  }
+});
 
-// Middleware
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Enhanced middleware setup
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Add request logging
+// Enhanced request logging with correlation IDs
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  console.log('Headers:', req.headers);
-  console.log('Body:', req.body);
+  req.correlationId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  logger.info(`${req.method} ${req.path}`, { 
+    correlationId: req.correlationId,
+    userAgent: req.headers['user-agent'],
+    ip: req.ip
+  });
   next();
 });
 
-// FILE STORAGE SETUP
-const ensureDirectoryExists = (dir) => {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-    console.log(`Created directory: ${dir}`);
-  }
-};
-
-// Create storage directories
-ensureDirectoryExists('./downloads');
-ensureDirectoryExists('./thumbnails');
-ensureDirectoryExists('./temp');
-
-// Serve static files
-app.use('/downloads', express.static(path.join(__dirname, 'downloads')));
-app.use('/thumbs', express.static(path.join(__dirname, 'thumbnails')));
-
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    if (file.fieldname === 'video') {
-      cb(null, './downloads/');
-    } else if (file.fieldname === 'thumbnail') {
-      cb(null, './thumbnails/');
-    } else {
-      cb(null, './temp/');
-    }
-  },
-  filename: function (req, file, cb) {
-    const { short_id } = req.body;
-    const extension = path.extname(file.originalname);
-    cb(null, `${short_id}${extension}`);
-  }
+// Health check middleware
+app.use('/health', (req, res, next) => {
+  res.setHeader('X-Health-Check', 'true');
+  next();
 });
 
-const upload = multer({ 
-  storage: storage,
-  limits: {
-    fileSize: 100 * 1024 * 1024 // 100MB limit
+// Enhanced keep-alive with circuit breaker pattern
+class ServiceKeepAlive {
+  constructor() {
+    this.services = [
+      { name: 'Business Bot', url: `${process.env.RENDER_EXTERNAL_URL || 'https://video-shorts-business-bot.onrender.com'}/health` },
+      { name: 'n8n Workflow', url: `${process.env.N8N_URL || 'https://n8n-on-render-wf30.onrender.com'}/health` }
+    ];
+    this.failureCount = new Map();
+    this.circuitOpen = new Map();
   }
-});
 
-// In-memory storage
-const users = new Map();
-const processingJobs = new Map();
+  async pingService(service) {
+    const failures = this.failureCount.get(service.name) || 0;
+    const isCircuitOpen = this.circuitOpen.get(service.name) || false;
 
-// Keep the service awake (ping itself every 14 minutes)
-setInterval(() => {
-  axios.get('https://video-shorts-business-bot.onrender.com/')
-    .catch(err => console.log('Self-ping failed:', err.message));
-}, 14 * 60 * 1000);
-
-function initUser(telegramId, userInfo) {
-  if (!users.has(telegramId)) {
-    users.set(telegramId, {
-      telegram_id: telegramId,
-      username: userInfo.username,
-      first_name: userInfo.first_name,
-      subscription_type: 'free',
-      subscription_expires: null,
-      daily_usage: 0,
-      total_usage: 0,
-      created_at: new Date().toISOString(),
-      referral_code: `REF${telegramId}`,
-      referred_users: 0
-    });
-  }
-  return users.get(telegramId);
-}
-
-function canProcessVideo(telegramId) {
-  const user = users.get(telegramId);
-  if (!user) return false;
-  
-  // Check if premium/pro subscription is still valid
-  if (user.subscription_type === 'premium' || user.subscription_type === 'pro') {
-    if (user.subscription_expires && new Date() < new Date(user.subscription_expires)) {
-      return true;
-    } else if (user.subscription_expires && new Date() >= new Date(user.subscription_expires)) {
-      // Subscription expired, downgrade to free
-      user.subscription_type = 'free';
-      user.subscription_expires = null;
+    if (isCircuitOpen && failures > 5) {
+      logger.warn(`Circuit breaker open for ${service.name}, skipping ping`);
+      return;
     }
-  }
-  
-  return user.daily_usage < 3;
-}
 
-function updateUsage(telegramId) {
-  const user = users.get(telegramId);
-  if (user) {
-    user.daily_usage += 1;
-    user.total_usage += 1;
-  }
-}
-
-// Reset daily usage at midnight
-function resetDailyUsage() {
-  const now = new Date();
-  const tomorrow = new Date(now);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  tomorrow.setHours(0, 0, 0, 0);
-  
-  const msUntilMidnight = tomorrow.getTime() - now.getTime();
-  
-  setTimeout(() => {
-    console.log('Resetting daily usage for all users...');
-    users.forEach(user => {
-      user.daily_usage = 0;
-    });
-    
-    // Schedule next reset (24 hours)
-    setInterval(() => {
-      console.log('Daily usage reset completed');
-      users.forEach(user => {
-        user.daily_usage = 0;
+    try {
+      const response = await axios.get(service.url, { 
+        timeout: 10000,
+        headers: { 'X-Health-Check': 'keep-alive' }
       });
-    }, 24 * 60 * 60 * 1000);
-  }, msUntilMidnight);
-}
-
-// Initialize daily usage reset
-resetDailyUsage();
-
-// Bot commands
-bot.onText(/\/start(?:\s+(.+))?/, (msg, match) => {
-  const chatId = msg.chat.id;
-  const user = initUser(msg.from.id, msg.from);
-  const referralCode = match && match[1] ? match[1] : null;
-  
-  console.log(`New user: ${msg.from.id}, Chat: ${chatId}, Referral: ${referralCode}`);
-  
-  // Handle referrals
-  if (referralCode && referralCode.startsWith('REF') && referralCode !== user.referral_code) {
-    const referrerId = referralCode.replace('REF', '');
-    const referrer = users.get(parseInt(referrerId));
-    if (referrer) {
-      referrer.referred_users += 1;
-      console.log(`Referral tracked: ${referrerId} referred ${msg.from.id}`);
+      
+      logger.info(`✅ ${service.name} is alive: ${response.status}`);
+      this.failureCount.set(service.name, 0);
+      this.circuitOpen.set(service.name, false);
+      
+    } catch (error) {
+      const newFailureCount = failures + 1;
+      this.failureCount.set(service.name, newFailureCount);
+      
+      if (newFailureCount > 5) {
+        this.circuitOpen.set(service.name, true);
+        logger.error(`Circuit breaker opened for ${service.name}`, { error: error.message });
+      } else {
+        logger.warn(`${service.name} ping failed (${newFailureCount}/5)`, { error: error.message });
+      }
     }
   }
+
+  async pingAll() {
+    await Promise.allSettled(
+      this.services.map(service => this.pingService(service))
+    );
+  }
+}
+
+const keepAlive = new ServiceKeepAlive();
+
+// Ping every 14 minutes
+setInterval(() => keepAlive.pingAll(), 14 * 60 * 1000);
+setTimeout(() => keepAlive.pingAll(), 5000); // Initial ping after 5 seconds
+
+// Enhanced daily usage reset with retry mechanism
+const dailyResetJob = new cron.CronJob('0 0 * * *', async () => {
+  logger.info('Starting daily usage reset...');
+  let retries = 3;
   
-  const subscriptionStatus = user.subscription_expires && new Date() < new Date(user.subscription_expires) 
-    ? `Active until ${new Date(user.subscription_expires).toLocaleDateString()}` 
-    : 'Free Plan';
+  while (retries > 0) {
+    try {
+      await db.resetDailyUsage();
+      logger.info('Daily usage reset completed successfully');
+      break;
+    } catch (error) {
+      retries--;
+      logger.error(`Daily reset failed (${3 - retries}/3)`, { error: error.message });
+      
+      if (retries === 0) {
+        // Send alert to admin
+        await sendAdminAlert('Daily usage reset failed after 3 attempts', error);
+      } else {
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds before retry
+      }
+    }
+  }
+}, null, true, 'UTC');
+
+// Enhanced multer configuration with better error handling
+const upload = multer({
+  dest: './temp/',
+  limits: {
+    fileSize: 200 * 1024 * 1024, // 200MB
+    files: 1
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /mp4|mov|avi|webm|jpg|jpeg|png/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only video and image files are allowed.'));
+    }
+  }
+});
+
+// Enhanced helper functions with caching
+class UserService {
+  constructor() {
+    this.cache = new Map();
+    this.cacheTimeout = 5 * 60 * 1000; // 5 minutes
+  }
+
+  async initUser(telegramId, userInfo) {
+    const cacheKey = `user_${telegramId}`;
+    const cached = this.cache.get(cacheKey);
+    
+    if (cached && (Date.now() - cached.timestamp) < this.cacheTimeout) {
+      return cached.user;
+    }
+
+    try {
+      let user = await db.getUser(telegramId);
+      if (!user) {
+        user = await db.createUser({
+          telegram_id: telegramId,
+          username: userInfo.username,
+          first_name: userInfo.first_name
+        });
+        logger.info('New user created', { telegramId, username: userInfo.username });
+      }
+
+      this.cache.set(cacheKey, { user, timestamp: Date.now() });
+      return user;
+    } catch (error) {
+      logger.error('Failed to initialize user', { telegramId, error: error.message });
+      throw error;
+    }
+  }
+
+  clearCache(telegramId) {
+    this.cache.delete(`user_${telegramId}`);
+  }
+
+  async canProcessVideo(telegramId) {
+    try {
+      return await db.canUseService(telegramId);
+    } catch (error) {
+      logger.error('Failed to check video processing eligibility', { telegramId, error: error.message });
+      return false;
+    }
+  }
+
+  async updateUsage(telegramId) {
+    this.clearCache(telegramId);
+    return await db.incrementUsage(telegramId);
+  }
+
+  async revertUsage(telegramId) {
+    this.clearCache(telegramId);
+    return await db.decrementUsage(telegramId);
+  }
+}
+
+const userService = new UserService();
+
+// Enhanced platform detection with validation
+function detectPlatform(url) {
+  if (!validator.isValidUrl(url)) {
+    throw new Error('Invalid URL format');
+  }
+
+  const videoUrl = url.toLowerCase();
+  const platforms = [
+    { name: 'YouTube', patterns: ['youtube.com', 'youtu.be'] },
+    { name: 'TikTok', patterns: ['tiktok.com', 'vm.tiktok.com'] },
+    { name: 'Instagram', patterns: ['instagram.com'] },
+    { name: 'Twitter', patterns: ['twitter.com', 'x.com'] }
+  ];
+
+  for (const platform of platforms) {
+    if (platform.patterns.some(pattern => videoUrl.includes(pattern))) {
+      return platform.name;
+    }
+  }
+  return 'Unknown';
+}
+
+// Enhanced admin alert system
+async function sendAdminAlert(message, error = null) {
+  try {
+    const adminChatId = process.env.ADMIN_CHAT_ID;
+    if (adminChatId) {
+      const alertMessage = `🚨 ADMIN ALERT\n\n${message}\n\nTime: ${new Date().toISOString()}${error ? `\n\nError: ${error.message}` : ''}`;
+      await bot.sendMessage(adminChatId, alertMessage);
+    }
+    logger.error('Admin alert sent', { message, error: error?.message });
+  } catch (alertError) {
+    logger.error('Failed to send admin alert', { error: alertError.message });
+  }
+}
+
+// Enhanced bot commands with better error handling and rate limiting
+bot.onText(/\/start(?:\s+(.+))?/, rateLimiter, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const telegramId = msg.from.id;
   
-  const welcomeMessage = `🎬 Welcome to VideoShortsBot!
+  try {
+    const user = await userService.initUser(telegramId, msg.from);
+    const referralCode = match && match[1] ? match[1] : null;
+    
+    // Enhanced referral handling
+    if (referralCode && referralCode.startsWith('REF') && referralCode !== user.referral_code) {
+      const referrerId = referralCode.replace('REF', '');
+      if (referrerId !== telegramId.toString()) {
+        try {
+          await db.processReferral(parseInt(referrerId), telegramId);
+          logger.info('Referral processed', { referrerId, newUserId: telegramId });
+        } catch (err) {
+          logger.warn('Referral processing failed', { referrerId, error: err.message });
+        }
+      }
+    }
+    
+    const subscriptionStatus = user.subscription_expires && new Date() < new Date(user.subscription_expires) 
+      ? `Active until ${new Date(user.subscription_expires).toLocaleDateString()}` 
+      : 'Free Plan';
+    
+    const welcomeMessage = `🎬 Welcome to VideoShortsBot!
 
 Transform long videos into viral shorts instantly!
 
@@ -203,22 +304,37 @@ Commands:
 /stats - Your statistics  
 /referral - Get your referral link
 /help - Need assistance?`;
-  
-  bot.sendMessage(chatId, welcomeMessage);
+    
+    await bot.sendMessage(chatId, welcomeMessage);
+    
+    await db.logUsage({
+      telegram_id: telegramId,
+      action: 'bot_started',
+      success: true
+    });
+    
+  } catch (error) {
+    logger.error('Start command error', { telegramId, error: error.message });
+    await bot.sendMessage(chatId, 'Welcome to VideoShortsBot! There was a temporary issue, but you can start using the bot by sending a video URL.');
+  }
 });
 
-bot.onText(/\/stats/, (msg) => {
-  const user = users.get(msg.from.id);
+bot.onText(/\/stats/, rateLimiter, async (msg) => {
+  const telegramId = msg.from.id;
+  const chatId = msg.chat.id;
   
-  if (!user) {
-    return bot.sendMessage(msg.chat.id, 'Please start the bot first with /start');
-  }
-  
-  const subscriptionStatus = user.subscription_expires && new Date() < new Date(user.subscription_expires)
-    ? `Active until ${new Date(user.subscription_expires).toLocaleDateString()}`
-    : user.subscription_type === 'free' ? 'Free Plan' : 'Expired';
-  
-  const statsMessage = `📊 YOUR STATISTICS
+  try {
+    const user = await db.getUser(telegramId);
+    
+    if (!user) {
+      return bot.sendMessage(chatId, 'Please start the bot first with /start');
+    }
+    
+    const subscriptionStatus = user.subscription_expires && new Date() < new Date(user.subscription_expires)
+      ? `Active until ${new Date(user.subscription_expires).toLocaleDateString()}`
+      : user.subscription_type === 'free' ? 'Free Plan' : 'Expired';
+    
+    const statsMessage = `📊 YOUR STATISTICS
 
 👤 Account: ${user.first_name}
 💳 Plan: ${user.subscription_type.toUpperCase()}
@@ -236,42 +352,16 @@ ${user.subscription_type === 'free' ?
   '🔓 Want unlimited access? /upgrade' : 
   subscriptionStatus.includes('Active') ? '✅ Premium account active' : '⚠️ Subscription expired - /upgrade'
 }`;
-  
-  bot.sendMessage(msg.chat.id, statsMessage);
-});
-
-bot.onText(/\/referral/, (msg) => {
-  const user = users.get(msg.from.id);
-  
-  if (!user) {
-    return bot.sendMessage(msg.chat.id, 'Please start the bot first with /start');
+    
+    await bot.sendMessage(chatId, statsMessage);
+    
+  } catch (error) {
+    logger.error('Stats command error', { telegramId, error: error.message });
+    await bot.sendMessage(chatId, 'Unable to fetch your statistics right now. Please try again later.');
   }
-  
-  const referralMessage = `🤝 REFERRAL PROGRAM
-
-Your Referral Link:
-https://t.me/videoshortsaibot?start=${user.referral_code}
-
-📊 Your Stats:
-👥 Referred Users: ${user.referred_users}
-🎁 Bonus Credits: ${Math.floor(user.referred_users / 5)} months free
-
-🎯 REWARDS:
-• 5 referrals = 1 month Premium FREE
-• 10 referrals = 2 months Premium FREE  
-• 20 referrals = Pro access for 1 month
-
-💰 PRO REFERRALS:
-Earn 30% commission on Premium/Pro sales from your referrals!
-
-Share your link and start earning!`;
-  
-  bot.sendMessage(msg.chat.id, referralMessage);
 });
 
 bot.onText(/\/upgrade/, (msg) => {
-  const user = users.get(msg.from.id);
-  
   const upgradeMessage = `💎 UPGRADE YOUR EXPERIENCE
 
 🇳🇬 NIGERIAN PRICING:
@@ -297,8 +387,7 @@ bot.onText(/\/upgrade/, (msg) => {
 • Bank Transfer • Debit Cards
 • USSD • Mobile Money
 
-Contact @Osezblessed to upgrade!
-Or use referral code: ${user.referral_code} for discount!`;
+Contact @Osezblessed to upgrade!`;
   
   const keyboard = {
     inline_keyboard: [
@@ -311,229 +400,287 @@ Or use referral code: ${user.referral_code} for discount!`;
   bot.sendMessage(msg.chat.id, upgradeMessage, {reply_markup: keyboard});
 });
 
-bot.onText(/\/help/, (msg) => {
-  const helpMessage = `❓ HOW TO USE VIDEOSHORTSBOT
-
-1️⃣ Send any video URL from:
-   • YouTube (youtube.com, youtu.be)
-   • TikTok (tiktok.com, vm.tiktok.com)
-   • Instagram (instagram.com) - Premium only
-   • Twitter/X (twitter.com, x.com) - Premium only
-
-2️⃣ Wait 1-3 minutes for processing
-
-3️⃣ Receive your viral shorts with download links!
-
-📝 SUPPORTED FORMATS:
-• Direct video links
-• Social media URLs
-• Public videos only (no private/restricted content)
-
-🚫 NOT SUPPORTED:
-• Private videos or stories
-• Live streams
-• Videos > 30 minutes (free users)
-• Copyrighted content without permission
-
-⚡ PROCESSING TIMES:
-• Free users: 2-5 minutes
-• Premium: 1-2 minutes (priority queue)
-• Pro: 30 seconds - 1 minute (highest priority)
-
-💡 TIPS:
-• Shorter videos (5-15 min) work best
-• Ensure good internet connection
-• Try different video qualities if processing fails
-
-Need help? Contact @Osezblessed
-Report bugs: Forward error messages to @Osezblessed`;
-  
-  bot.sendMessage(msg.chat.id, helpMessage);
-});
-
-// Handle callback queries
-bot.on('callback_query', (query) => {
-  const chatId = query.message.chat.id;
-  const data = query.data;
-  
-  if (data === 'referral_info') {
-    bot.answerCallbackQuery(query.id);
-    bot.sendMessage(chatId, 'Use /referral to get your referral link and start earning!');
+// Enhanced video processing with queue management
+class VideoProcessingQueue {
+  constructor() {
+    this.processing = new Map();
+    this.maxConcurrent = {
+      free: 2,
+      premium: 5,
+      pro: 10
+    };
+    this.currentProcessing = {
+      free: 0,
+      premium: 0,
+      pro: 0
+    };
   }
-});
 
-// Handle video URLs
+  canProcess(subscriptionType) {
+    return this.currentProcessing[subscriptionType] < this.maxConcurrent[subscriptionType];
+  }
+
+  startProcessing(processingId, subscriptionType) {
+    this.processing.set(processingId, subscriptionType);
+    this.currentProcessing[subscriptionType]++;
+  }
+
+  finishProcessing(processingId) {
+    const subscriptionType = this.processing.get(processingId);
+    if (subscriptionType) {
+      this.processing.delete(processingId);
+      this.currentProcessing[subscriptionType]--;
+    }
+  }
+}
+
+const processingQueue = new VideoProcessingQueue();
+
+// Enhanced video URL processing
 bot.on('message', async (msg) => {
   if (msg.text && msg.text.startsWith('/')) return;
   
-  if (msg.text && (msg.text.includes('youtube.com') || msg.text.includes('youtu.be') || 
-                   msg.text.includes('tiktok.com') || msg.text.includes('instagram.com') ||
-                   msg.text.includes('vm.tiktok.com') || msg.text.includes('twitter.com') || 
-                   msg.text.includes('x.com'))) {
-    
+  const videoUrlPattern = /(youtube\.com|youtu\.be|tiktok\.com|vm\.tiktok\.com|instagram\.com|twitter\.com|x\.com)/i;
+  
+  if (msg.text && videoUrlPattern.test(msg.text)) {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
     const videoUrl = msg.text.trim();
     
-    console.log(`Processing video request from user ${telegramId}, chat ${chatId}: ${videoUrl}`);
+    logger.info('Processing video request', { telegramId, videoUrl });
     
-    const user = initUser(telegramId, msg.from);
-    
-    if (!canProcessVideo(telegramId)) {
-      const limitMessage = `🚫 Daily limit reached!
+    try {
+      // Input validation
+      if (!validator.isValidUrl(videoUrl)) {
+        return bot.sendMessage(chatId, '❌ Invalid URL format. Please send a valid video URL.');
+      }
+
+      const user = await userService.initUser(telegramId, msg.from);
+      
+      if (!(await userService.canProcessVideo(telegramId))) {
+        const limitMessage = `🚫 Daily limit reached!
 
 You've used your 3 free videos today.
 
-💎 Upgrade to Premium for:
-• ✅ Unlimited videos
-• ✅ Priority processing  
-• ✅ All platforms
-• ✅ Custom lengths
-• ✅ No watermarks
-
-Or wait until tomorrow for your free videos to reset!
-
+💎 Upgrade to Premium for unlimited access!
 Contact @Osezblessed to upgrade instantly!`;
+        
+        return bot.sendMessage(chatId, limitMessage);
+      }
       
-      const keyboard = {
-        inline_keyboard: [
-          [{text: '💎 Upgrade Now', url: 'https://t.me/Osezblessed'}],
-          [{text: '🤝 Get Free Credits via Referrals', callback_data: 'referral_info'}]
-        ]
+      // Check platform restrictions
+      if (user.subscription_type === 'free') {
+        const platform = detectPlatform(videoUrl);
+        if (['Instagram', 'Twitter'].includes(platform)) {
+          return bot.sendMessage(chatId, `🔒 ${platform} processing requires Premium subscription. Contact @Osezblessed to upgrade!`);
+        }
+      }
+
+      // Check processing queue
+      if (!processingQueue.canProcess(user.subscription_type)) {
+        return bot.sendMessage(chatId, '⏳ Processing queue is full. Please try again in a few minutes.');
+      }
+      
+      const processingId = `proc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      // Start processing
+      processingQueue.startProcessing(processingId, user.subscription_type);
+      
+      const processingMessages = {
+        free: '🎬 Processing your video... This may take 2-5 minutes.',
+        premium: '🎬 ⚡ Premium processing started... 1-2 minutes remaining.',
+        pro: '🎬 🚀 Pro processing initiated... 30-60 seconds remaining.'
       };
       
-      return bot.sendMessage(chatId, limitMessage, {reply_markup: keyboard});
-    }
-    
-    // Check platform restrictions
-    if (user.subscription_type === 'free') {
-      if (videoUrl.includes('instagram.com')) {
-        return bot.sendMessage(chatId, '🔒 Instagram processing requires Premium subscription. Contact @Osezblessed to upgrade!');
-      }
-      if (videoUrl.includes('twitter.com') || videoUrl.includes('x.com')) {
-        return bot.sendMessage(chatId, '🔒 Twitter/X processing requires Premium subscription. Contact @Osezblessed to upgrade!');
-      }
-    }
-    
-    const processingMessage = user.subscription_type === 'free' 
-      ? '🎬 Processing your video... This may take 2-5 minutes.'
-      : user.subscription_type === 'premium'
-      ? '🎬 ⚡ Premium processing started... 1-2 minutes remaining.'
-      : '🎬 🚀 Pro processing initiated... 30-60 seconds remaining.';
-    
-    bot.sendMessage(chatId, processingMessage);
-    
-    updateUsage(telegramId);
-    
-    try {
-      console.log('Calling n8n workflow...');
+      await bot.sendMessage(chatId, processingMessages[user.subscription_type]);
       
-      const response = await axios.post('https://n8n-on-render-wf30.onrender.com/webhook/video-processing', {
+      const videoRecord = await db.createVideo({
+        processing_id: processingId,
+        telegram_id: telegramId,
+        video_url: videoUrl,
+        platform: detectPlatform(videoUrl)
+      });
+      
+      await userService.updateUsage(telegramId);
+      
+      // Enhanced n8n workflow call with retry mechanism
+      const n8nPayload = {
         telegram_id: telegramId,
         chat_id: chatId,
         video_url: videoUrl,
         user_name: user.first_name,
         subscription_type: user.subscription_type,
-        webhook_secret: '7f9d0d2e8a6f4f38a13a2bcf5b6d441b91c9d26e8b72714d2edcf7c4e2a843ke',
-        business_bot_url: 'https://video-shorts-business-bot.onrender.com',
+        webhook_secret: process.env.N8N_WEBHOOK_SECRET || '7f9d0d2e8a6f4f38a13a2bcf5b6d441b91c9d26e8b72714d2edcf7c4e2a843ke',
+        business_bot_url: process.env.RENDER_EXTERNAL_URL || 'https://video-shorts-business-bot.onrender.com',
+        processing_id: processingId,
         user_limits: {
           max_shorts: user.subscription_type === 'free' ? 2 : user.subscription_type === 'premium' ? 4 : 6,
           max_duration: user.subscription_type === 'free' ? 60 : 90,
           priority: user.subscription_type === 'free' ? 'low' : user.subscription_type === 'premium' ? 'medium' : 'high'
         }
-      }, {
-        timeout: 30000,
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-      
-      console.log('n8n workflow response:', response.data);
-      
-      if (response.data.processing_id) {
-        processingJobs.set(response.data.processing_id, {
-          telegramId,
-          chatId,
-          videoUrl,
-          startTime: Date.now(),
-          subscription_type: user.subscription_type
-        });
-        
-        // Set timeout based on subscription type
-        const timeoutDuration = user.subscription_type === 'free' ? 10 * 60 * 1000 : // 10 minutes
-                               user.subscription_type === 'premium' ? 5 * 60 * 1000 : // 5 minutes  
-                               3 * 60 * 1000; // 3 minutes for pro
-        
-        setTimeout(() => {
-          if (processingJobs.has(response.data.processing_id)) {
-            console.log(`Timeout for processing ${response.data.processing_id}`);
-            bot.sendMessage(chatId, `⏰ Processing is taking longer than expected.
+      };
 
-This might be due to:
-• High server load
-• Large video file
-• Complex video content
-
-Please wait a bit more or contact @Osezblessed if this persists.`);
-            processingJobs.delete(response.data.processing_id);
+      let retries = 3;
+      let lastError;
+      
+      while (retries > 0) {
+        try {
+          const response = await axios.post(
+            'https://n8n-on-render-wf30.onrender.com/webhook/video-processing',
+            n8nPayload,
+            {
+              timeout: 30000,
+              headers: { 'Content-Type': 'application/json' }
+            }
+          );
+          
+          logger.info('n8n workflow triggered successfully', { 
+            processingId, 
+            telegramId, 
+            response: response.data 
+          });
+          break;
+          
+        } catch (error) {
+          lastError = error;
+          retries--;
+          
+          if (retries > 0) {
+            logger.warn(`n8n call failed, retrying (${3-retries}/3)`, { 
+              processingId, 
+              error: error.message 
+            });
+            await new Promise(resolve => setTimeout(resolve, 2000));
           }
-        }, timeoutDuration);
+        }
       }
       
-    } catch (error) {
-      console.error('Error calling n8n workflow:', error.message);
+      if (retries === 0) {
+        throw lastError;
+      }
       
-      bot.sendMessage(chatId, `❌ Processing failed: ${error.response?.data?.message || error.message}
+      await db.logUsage({
+        telegram_id: telegramId,
+        video_id: videoRecord.id,
+        processing_id: processingId,
+        action: 'video_processing_started',
+        platform: detectPlatform(videoUrl),
+        success: true
+      });
+      
+    } catch (error) {
+      logger.error('Video processing error', { telegramId, videoUrl, error: error.message });
+      
+      await bot.sendMessage(chatId, `❌ Processing failed: ${error.response?.data?.message || error.message}
 
 🔄 Please try again in a few minutes.
 📞 If the issue persists, contact @Osezblessed
 
 Error code: ${error.response?.status || 'NETWORK_ERROR'}`);
       
-      // Revert usage count on error
-      const user = users.get(telegramId);
-      if (user && user.daily_usage > 0) {
-        user.daily_usage -= 1;
-        user.total_usage -= 1;
-      }
+      await userService.revertUsage(telegramId);
+      processingQueue.finishProcessing(processingId);
+      
+      await db.logUsage({
+        telegram_id: telegramId,
+        processing_id: processingId || null,
+        action: 'video_processing_failed',
+        platform: detectPlatform(videoUrl).catch(() => 'Unknown'),
+        success: false,
+        error_message: error.message
+      });
     }
   }
 });
 
-// FILE UPLOAD ENDPOINTS
-
-// Upload processed video files from n8n
-app.post('/upload-processed-video', upload.single('video'), (req, res) => {
+// Enhanced file upload endpoints with better error handling
+app.post('/upload-processed-video', upload.single('video'), async (req, res) => {
   try {
-    console.log('Received file upload:', req.file);
-    console.log('Upload body:', req.body);
+    logger.info('Received video upload', { 
+      body: req.body,
+      file: req.file ? { 
+        originalname: req.file.originalname, 
+        size: req.file.size, 
+        mimetype: req.file.mimetype 
+      } : null 
+    });
     
     const { processing_id, short_id } = req.body;
     const file = req.file;
     
     if (!file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      return res.status(400).json({ error: 'No video file uploaded' });
     }
     
-    const fileUrl = `https://video-shorts-business-bot.onrender.com/downloads/${file.filename}`;
+    if (!processing_id || !short_id) {
+      return res.status(400).json({ error: 'Missing processing_id or short_id' });
+    }
     
-    console.log(`File uploaded successfully: ${fileUrl}`);
+    // Enhanced file validation
+    const maxFileSize = 200 * 1024 * 1024; // 200MB
+    if (file.size > maxFileSize) {
+      await fs.unlink(file.path).catch(console.error);
+      return res.status(400).json({ error: 'File too large. Maximum size is 200MB.' });
+    }
     
-    res.json({ 
-      success: true, 
-      file_url: fileUrl,
+    const fileBuffer = await fs.readFile(file.path);
+    const contentType = mime.lookup(file.originalname) || 'video/mp4';
+    
+    const fileName = `${short_id}_${Date.now()}.mp4`;
+    const storagePath = `videos/${processing_id}/${fileName}`;
+    
+    // Upload with retry mechanism
+    let uploadResult;
+    let retries = 3;
+    
+    while (retries > 0) {
+      try {
+        uploadResult = await db.uploadFile('video-files', storagePath, fileBuffer, contentType);
+        break;
+      } catch (uploadError) {
+        retries--;
+        if (retries === 0) throw uploadError;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+    
+    await fs.unlink(file.path);
+    
+    await db.updateVideo(processing_id, {
+      file_path: storagePath,
+      file_url: uploadResult.publicUrl,
       file_size: file.size,
-      filename: file.filename
+      status: 'completed'
+    });
+    
+    logger.info('Video uploaded successfully', { 
+      processingId: processing_id,
+      fileUrl: uploadResult.publicUrl,
+      fileSize: file.size 
+    });
+    
+    res.json({
+      success: true,
+      file_url: uploadResult.publicUrl,
+      file_size: file.size,
+      file_path: storagePath
     });
     
   } catch (error) {
-    console.error('File upload error:', error);
-    res.status(500).json({ error: 'Upload failed', details: error.message });
+    logger.error('Video upload error', { error: error.message });
+    
+    if (req.file?.path) {
+      await fs.unlink(req.file.path).catch(console.error);
+    }
+    
+    res.status(500).json({ 
+      error: 'Video upload failed', 
+      details: error.message 
+    });
   }
 });
 
-// Upload thumbnail
-app.post('/upload-thumbnail', upload.single('thumbnail'), (req, res) => {
+app.post('/upload-thumbnail', upload.single('thumbnail'), async (req, res) => {
   try {
     const { processing_id, short_id } = req.body;
     const file = req.file;
@@ -542,58 +689,44 @@ app.post('/upload-thumbnail', upload.single('thumbnail'), (req, res) => {
       return res.status(400).json({ error: 'No thumbnail uploaded' });
     }
     
-    const thumbnailUrl = `https://video-shorts-business-bot.onrender.com/thumbs/${file.filename}`;
+    const fileBuffer = await fs.readFile(file.path);
+    const contentType = mime.lookup(file.originalname) || 'image/jpeg';
     
-    res.json({ 
-      success: true, 
-      thumbnail_url: thumbnailUrl,
-      filename: file.filename
+    const fileName = `${short_id}_thumb_${Date.now()}.jpg`;
+    const storagePath = `thumbnails/${processing_id}/${fileName}`;
+    
+    const uploadResult = await db.uploadFile('thumbnails', storagePath, fileBuffer, contentType);
+    
+    await fs.unlink(file.path);
+    
+    await db.updateVideo(processing_id, {
+      thumbnail_path: storagePath,
+      thumbnail_url: uploadResult.publicUrl
+    });
+    
+    res.json({
+      success: true,
+      thumbnail_url: uploadResult.publicUrl,
+      thumbnail_path: storagePath
     });
     
   } catch (error) {
-    console.error('Thumbnail upload error:', error);
-    res.status(500).json({ error: 'Thumbnail upload failed', details: error.message });
-  }
-});
-
-// Handle missing files gracefully
-app.get('/downloads/:filename', (req, res, next) => {
-  const filename = req.params.filename;
-  const filePath = path.join(__dirname, 'downloads', filename);
-  
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({
-      error: 'File not found',
-      message: 'This file may not have been processed yet, or this is a demo link.',
-      filename: filename,
-      suggestion: 'Please wait for processing to complete, or contact support if this persists.'
+    logger.error('Thumbnail upload error', { error: error.message });
+    
+    if (req.file?.path) {
+      await fs.unlink(req.file.path).catch(console.error);
+    }
+    
+    res.status(500).json({ 
+      error: 'Thumbnail upload failed', 
+      details: error.message 
     });
   }
-  
-  // File exists, let express.static handle it
-  next();
 });
 
-app.get('/thumbs/:filename', (req, res, next) => {
-  const filename = req.params.filename;
-  const filePath = path.join(__dirname, 'thumbnails', filename);
-  
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).json({
-      error: 'Thumbnail not found',
-      message: 'Thumbnail may still be generating.',
-      filename: filename
-    });
-  }
-  
-  next();
-});
-
-// WEBHOOK ENDPOINTS
-
-// Primary callback endpoint (matches your n8n workflow)
+// Enhanced webhook callback handling
 app.post('/webhook/n8n-callback', async (req, res) => {
-  console.log('📨 Received n8n callback:', JSON.stringify(req.body, null, 2));
+  logger.info('Received n8n callback', { body: req.body });
   
   try {
     const {
@@ -604,22 +737,25 @@ app.post('/webhook/n8n-callback', async (req, res) => {
       shorts_results,
       total_shorts,
       subscription_type,
-      processing_completed_at,
-      video_info
+      processing_completed_at
     } = req.body;
     
     const telegramIdNum = parseInt(telegram_id);
     const chatIdNum = parseInt(chat_id);
     
-    console.log(`Processing callback - Status: ${status}, Telegram: ${telegramIdNum}, Chat: ${chatIdNum}`);
-    
-    if (!telegramIdNum || !chatIdNum) {
-      console.error('Missing or invalid telegram_id/chat_id:', { telegram_id, chat_id });
-      return res.status(400).json({
-        status: 'error',
-        message: 'Missing or invalid telegram_id or chat_id'
-      });
+    if (!telegramIdNum || !chatIdNum || !processing_id) {
+      logger.error('Invalid callback data', { telegram_id, chat_id, processing_id });
+      return res.status(400).json({ error: 'Missing required fields' });
     }
+    
+    // Finish processing queue
+    processingQueue.finishProcessing(processing_id);
+    
+    const videoRecord = await db.updateVideo(processing_id, {
+      status: status === 'completed' ? 'completed' : 'failed',
+      completed_at: status === 'completed' ? new Date().toISOString() : null,
+      error_message: status === 'failed' ? req.body.error_message : null
+    });
     
     if (status === 'completed') {
       let results;
@@ -629,58 +765,68 @@ app.post('/webhook/n8n-callback', async (req, res) => {
         results = shorts_results || [];
       }
       
-      if (!Array.isArray(results)) {
-        results = [results];
+      if (!Array.isArray(results)) results = [results];
+      
+      // Save shorts to database with enhanced error handling
+      for (const short of results) {
+        try {
+          await db.createShort({
+            video_id: videoRecord.id,
+            short_id: short.short_id,
+            title: short.title,
+            file_url: short.file_url,
+            thumbnail_url: short.thumbnail_url,
+            duration: short.duration,
+            quality: short.quality,
+            file_size: short.file_size ? parseInt(short.file_size) : null,
+            features_applied: short.features_applied || [],
+            watermark: short.watermark
+          });
+        } catch (shortError) {
+          logger.error('Failed to save short', { 
+            shortId: short.short_id, 
+            error: shortError.message 
+          });
+        }
       }
       
       let message = `✅ Your ${total_shorts || results.length} shorts are ready!
 
 🎬 Processing completed successfully
 📱 Quality: ${results[0]?.quality || '720p'}
-⏱️ Processing time: ${processing_completed_at ? 'Just completed' : 'Unknown'}
-${video_info?.title ? `🎯 Source: ${video_info.title.substring(0, 50)}...` : ''}
+⏱️ Processing time: Just completed
 
 📥 Download links:`;
       
       results.forEach((short, index) => {
         message += `\n\n🎥 Short ${index + 1}: ${short.title || 'Video Short'}`;
-        if (short.file_url && !short.file_url.includes('example.com')) {
+        if (short.file_url && !short.file_url.includes('demo.videoshortsbot.com')) {
           message += `\n📎 ${short.file_url}`;
         } else {
           message += `\n📎 [Processing complete - file will be available shortly]`;
         }
-        if (short.thumbnail_url && !short.thumbnail_url.includes('placeholder')) {
-          message += `\n🖼️ Preview: ${short.thumbnail_url}`;
-        }
         if (short.duration) {
           message += `\n⏱️ Duration: ${short.duration}s`;
-        }
-        if (short.watermark && subscription_type === 'free') {
-          message += `\n💧 Watermark: ${short.watermark}`;
         }
       });
       
       if (subscription_type === 'free') {
-        message += `\n\n🚀 Upgrade to Premium for:
-• 🎯 HD Quality (1080p)
-• 🚫 No Watermarks
-• 📈 Unlimited Processing
-• 🎵 Auto Music & Captions
-• ⚡ Priority Processing
-
+        message += `\n\n🚀 Upgrade to Premium for HD quality and no watermarks!
 Contact @Osezblessed to upgrade!`;
       }
       
-      // Add usage stats for premium users
-      if (subscription_type !== 'free') {
-        message += `\n\n📊 This ${subscription_type} processing:
-• Quality: ${results[0]?.quality}${subscription_type === 'pro' ? ' (Ultra HD)' : ''}
-• Features: ${results[0]?.features_applied?.join(', ') || 'Standard'}
-${subscription_type === 'pro' ? '• Analytics: Available in Pro dashboard' : ''}`;
-      }
-      
       await bot.sendMessage(chatIdNum, message);
-      console.log(`✅ Success message sent to chat ${chatIdNum}`);
+      
+      // Log successful completion
+      await db.logUsage({
+        telegram_id: telegramIdNum,
+        video_id: videoRecord.id,
+        processing_id: processing_id,
+        action: 'video_processing_completed',
+        success: true,
+        processing_time: processing_completed_at ? 
+          Math.floor((new Date(processing_completed_at) - new Date(videoRecord.created_at)) / 1000) : null
+      });
       
     } else if (status === 'error' || status === 'failed') {
       const errorMsg = `❌ Processing failed
@@ -689,368 +835,678 @@ ${req.body.error_message || 'Unknown error occurred'}
 
 🔄 What to try:
 • Check if video URL is accessible
-• Try a shorter video (under 20 minutes)
-• Ensure video is not private/restricted
+• Try a shorter video
 • Wait a few minutes and try again
 
-Contact @Osezblessed if this persists.
-Processing ID: ${processing_id}`;
+Contact @Osezblessed if this persists.`;
 
       await bot.sendMessage(chatIdNum, errorMsg);
-      console.log(`❌ Error message sent to chat ${chatIdNum}`);
       
       // Revert usage for failed processing
-      const user = users.get(telegramIdNum);
-      if (user && user.daily_usage > 0) {
-        user.daily_usage -= 1;
-        user.total_usage -= 1;
-      }
+      await userService.revertUsage(telegramIdNum);
+      
+      // Log failed completion
+      await db.logUsage({
+        telegram_id: telegramIdNum,
+        video_id: videoRecord?.id,
+        processing_id: processing_id,
+        action: 'video_processing_failed',
+        success: false,
+        error_message: req.body.error_message
+      });
     }
     
-    // Clean up processing job
-    if (processing_id) {
-      processingJobs.delete(processing_id);
-    }
-    
-    res.json({ 
-      status: 'success', 
-      message: 'Callback processed successfully',
-      processed_for: chatIdNum
-    });
+    res.json({ status: 'success', message: 'Callback processed' });
     
   } catch (error) {
-    console.error('Error processing callback:', error);
+    logger.error('Error processing callback', { error: error.message });
+    res.status(500).json({ error: 'Failed to process callback', details: error.message });
+  }
+});
+
+// Enhanced health check with comprehensive system status
+app.get('/health', async (req, res) => {
+  try {
+    const healthStatus = {
+      timestamp: new Date().toISOString(),
+      status: 'healthy',
+      services: {},
+      database: {},
+      storage: {},
+      system: {
+        uptime: Math.floor(process.uptime()),
+        memory: process.memoryUsage(),
+        version: process.version,
+        platform: process.platform
+      },
+      processing: {
+        queue_status: processingQueue.currentProcessing,
+        max_concurrent: processingQueue.maxConcurrent
+      }
+    };
+
+    // Test database connection with timeout
+    try {
+      const dbStart = Date.now();
+      const { data, error } = await Promise.race([
+        db.supabase.from('users').select('count', { count: 'exact', head: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Database timeout')), 5000))
+      ]);
+      
+      healthStatus.database.status = error ? 'error' : 'connected';
+      healthStatus.database.response_time = Date.now() - dbStart;
+      healthStatus.database.error = error?.message;
+      
+    } catch (dbError) {
+      healthStatus.database.status = 'error';
+      healthStatus.database.error = dbError.message;
+    }
+
+    // Test storage connection
+    try {
+      const storageStart = Date.now();
+      const { data: buckets, error } = await Promise.race([
+        db.supabase.storage.listBuckets(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Storage timeout')), 5000))
+      ]);
+      
+      healthStatus.storage.status = error ? 'error' : 'connected';
+      healthStatus.storage.response_time = Date.now() - storageStart;
+      healthStatus.storage.buckets = buckets?.map(b => b.name) || [];
+      healthStatus.storage.error = error?.message;
+      
+    } catch (storageError) {
+      healthStatus.storage.status = 'error';
+      healthStatus.storage.error = storageError.message;
+    }
+
+    // Test n8n connectivity
+    try {
+      const n8nStart = Date.now();
+      const n8nResponse = await Promise.race([
+        axios.get(`${process.env.N8N_URL || 'https://n8n-on-render-wf30.onrender.com'}/health`, { timeout: 5000 }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('n8n timeout')), 5000))
+      ]);
+      
+      healthStatus.services.n8n = {
+        status: 'connected',
+        response_code: n8nResponse.status,
+        response_time: Date.now() - n8nStart
+      };
+    } catch (n8nError) {
+      healthStatus.services.n8n = {
+        status: 'error',
+        error: n8nError.message
+      };
+    }
+
+    // Test Telegram Bot API
+    try {
+      const botStart = Date.now();
+      const botInfo = await bot.getMe();
+      healthStatus.services.telegram = {
+        status: 'connected',
+        bot_username: botInfo.username,
+        response_time: Date.now() - botStart
+      };
+    } catch (botError) {
+      healthStatus.services.telegram = {
+        status: 'error',
+        error: botError.message
+      };
+    }
+
+    // Overall status determination
+    const hasErrors = healthStatus.database.status === 'error' || 
+                     healthStatus.storage.status === 'error' ||
+                     healthStatus.services.n8n?.status === 'error' ||
+                     healthStatus.services.telegram?.status === 'error';
+    
+    healthStatus.status = hasErrors ? 'degraded' : 'healthy';
+
+    res.status(hasErrors ? 503 : 200).json(healthStatus);
+  } catch (error) {
+    logger.error('Health check error', { error: error.message });
     res.status(500).json({
       status: 'error',
-      message: 'Failed to process callback',
-      error: error.message
+      message: error.message,
+      timestamp: new Date().toISOString()
     });
   }
 });
 
-// Error callback endpoint
-app.post('/webhook/n8n-error', async (req, res) => {
-  console.log('📨 Received n8n error callback:', JSON.stringify(req.body, null, 2));
-  
+// Enhanced metrics endpoint
+app.get('/metrics', async (req, res) => {
   try {
-    const { telegram_id, chat_id, error_message, processing_id, error_type } = req.body;
+    const stats = await db.getStats();
     
-    const chatIdNum = parseInt(chat_id);
-    const telegramIdNum = parseInt(telegram_id);
-    
-    if (chatIdNum) {
-      const errorMsg = `❌ Video Processing Failed
-
-🔍 Error: ${error_message || 'Unknown error occurred'}
-📝 Type: ${error_type || 'processing_error'}
-
-🔄 What to do:
-• Check if the video URL is valid and accessible
-• Ensure the video is public (not private/restricted)
-• Try with a shorter video (under 20 minutes for free users)
-• Wait a few minutes and try again
-• Contact @Osezblessed if the issue persists
-
-💡 Tips:
-• YouTube videos work best
-• Avoid very long videos (30+ minutes)
-• Ensure stable internet connection
-
-Processing ID: ${processing_id || 'N/A'}`;
-
-      await bot.sendMessage(chatIdNum, errorMsg);
-      
-      // Revert usage count on error
-      const user = users.get(telegramIdNum);
-      if (user && user.daily_usage > 0) {
-        user.daily_usage -= 1;
-        user.total_usage -= 1;
+    const metrics = {
+      timestamp: new Date().toISOString(),
+      users: {
+        total: stats.users.total,
+        active_today: stats.users.active_today || 0,
+        free: stats.users.free,
+        premium: stats.users.premium,
+        pro: stats.users.pro,
+        conversion_rate: stats.users.total > 0 ? 
+          (((stats.users.premium + stats.users.pro) / stats.users.total) * 100).toFixed(2) : 0
+      },
+      videos: {
+        total_processed: stats.videos.total,
+        completed: stats.videos.completed,
+        processing: stats.videos.processing,
+        failed: stats.videos.failed,
+        success_rate: stats.videos.total > 0 ? 
+          ((stats.videos.completed / stats.videos.total) * 100).toFixed(2) : 0,
+        avg_processing_time: stats.videos.avg_processing_time || 0
+      },
+      revenue: {
+        monthly_mrr: ((stats.users.premium * 2.99) + (stats.users.pro * 9.99)).toFixed(2),
+        arpu: stats.users.total > 0 ? 
+          (((stats.users.premium * 2.99) + (stats.users.pro * 9.99)) / stats.users.total).toFixed(2) : 0,
+        ltv_estimate: ((stats.users.premium * 2.99 * 12) + (stats.users.pro * 9.99 * 12)).toFixed(2)
+      },
+      system: {
+        uptime_seconds: Math.floor(process.uptime()),
+        memory_usage: process.memoryUsage(),
+        node_version: process.version,
+        platform: process.platform,
+        processing_queue: processingQueue.currentProcessing
+      },
+      performance: {
+        response_times: {
+          database: 0, // This would be populated from monitoring
+          storage: 0,
+          n8n: 0
+        },
+        error_rates: {
+          last_hour: 0, // This would be calculated from logs
+          last_24h: 0
+        }
       }
-    }
-    
-    // Clean up processing job
-    if (processing_id) {
-      processingJobs.delete(processing_id);
-    }
-    
-    res.json({ status: 'success', message: 'Error callback processed' });
-    
+    };
+
+    res.json(metrics);
   } catch (error) {
-    console.error('Error processing error callback:', error);
-    res.status(500).json({ status: 'error', message: error.message });
+    logger.error('Metrics error', { error: error.message });
+    res.status(500).json({
+      error: 'Failed to get metrics',
+      message: error.message
+    });
   }
 });
 
-// ADMIN AND ANALYTICS ENDPOINTS
+// Enhanced storage usage endpoint
+app.get('/storage-usage', async (req, res) => {
+  try {
+    const [videoFiles, thumbnailFiles] = await Promise.all([
+      db.supabase.storage.from('video-files').list('', { limit: 1000 }),
+      db.supabase.storage.from('thumbnails').list('', { limit: 1000 })
+    ]);
 
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.json({
-    status: 'VideoShortsBot Business API Running',
-    version: '2.0.0',
-    timestamp: new Date(),
-    stats: {
-      total_users: users.size,
-      active_processing_jobs: processingJobs.size,
-      uptime_seconds: Math.floor(process.uptime())
-    },
-    features: [
-      'File Storage',
-      'Premium Subscriptions', 
-      'Referral System',
-      'Multi-platform Support'
-    ]
-  });
-});
-
-// Enhanced admin stats endpoint
-app.get('/admin/stats', (req, res) => {
-  const now = new Date();
-  const today = now.toDateString();
-  const thisMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-  
-  const stats = {
-    overview: {
-      total_users: users.size,
-      free_users: Array.from(users.values()).filter(u => u.subscription_type === 'free').length,
-      premium_users: Array.from(users.values()).filter(u => u.subscription_type === 'premium').length,
-      pro_users: Array.from(users.values()).filter(u => u.subscription_type === 'pro').length,
-      active_processing_jobs: processingJobs.size
-    },
-    usage_stats: {
-      total_videos_processed: Array.from(users.values()).reduce((sum, u) => sum + u.total_usage, 0),
-      videos_today: Array.from(users.values()).reduce((sum, u) => sum + u.daily_usage, 0),
-      average_daily_usage: users.size > 0 ? (Array.from(users.values()).reduce((sum, u) => sum + u.daily_usage, 0) / users.size).toFixed(2) : 0
-    },
-    referral_stats: {
-      total_referrals: Array.from(users.values()).reduce((sum, u) => sum + u.referred_users, 0),
-      top_referrers: Array.from(users.values())
-        .filter(u => u.referred_users > 0)
-        .sort((a, b) => b.referred_users - a.referred_users)
-        .slice(0, 5)
-        .map(u => ({
-          name: u.first_name,
-          telegram_id: u.telegram_id,
-          referrals: u.referred_users
-        }))
-    },
-    revenue_projection: {
-      monthly_premium_revenue: Array.from(users.values()).filter(u => u.subscription_type === 'premium').length * 2.99,
-      monthly_pro_revenue: Array.from(users.values()).filter(u => u.subscription_type === 'pro').length * 9.99,
-      total_monthly_projection: (Array.from(users.values()).filter(u => u.subscription_type === 'premium').length * 2.99) + 
-                               (Array.from(users.values()).filter(u => u.subscription_type === 'pro').length * 9.99)
-    },
-    recent_users: Array.from(users.entries())
-      .sort(([,a], [,b]) => new Date(b.created_at) - new Date(a.created_at))
-      .slice(0, 10)
-      .map(([id, user]) => ({
-        telegram_id: id,
-        name: user.first_name,
-        subscription: user.subscription_type,
-        daily_usage: user.daily_usage,
-        total_usage: user.total_usage,
-        joined: user.created_at
-      }))
-  };
-  
-  res.json(stats);
-});
-
-// Analytics dashboard (HTML)
-app.get('/dashboard', (req, res) => {
-  const stats = {
-    total_users: users.size,
-    premium_users: Array.from(users.values()).filter(u => u.subscription_type === 'premium').length,
-    pro_users: Array.from(users.values()).filter(u => u.subscription_type === 'pro').length,
-    total_videos: Array.from(users.values()).reduce((sum, u) => sum + u.total_usage, 0)
-  };
-  
-  const html = `
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <title>VideoShortsBot Dashboard</title>
-    <style>
-      body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-      .card { background: white; padding: 20px; margin: 10px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-      .stat { font-size: 2em; font-weight: bold; color: #2196F3; }
-      .label { color: #666; margin-top: 5px; }
-      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
-    </style>
-  </head>
-  <body>
-    <h1>📊 VideoShortsBot Analytics Dashboard</h1>
-    <div class="grid">
-      <div class="card">
-        <div class="stat">${stats.total_users}</div>
-        <div class="label">Total Users</div>
-      </div>
-      <div class="card">
-        <div class="stat">${stats.premium_users}</div>
-        <div class="label">Premium Users</div>
-      </div>
-      <div class="card">
-        <div class="stat">${stats.pro_users}</div>
-        <div class="label">Pro Users</div>
-      </div>
-      <div class="card">
-        <div class="stat">${stats.total_videos}</div>
-        <div class="label">Videos Processed</div>
-      </div>
-      <div class="card">
-        <div class="stat">${((stats.premium_users * 2.99) + (stats.pro_users * 9.99)).toFixed(2)}</div>
-        <div class="label">Monthly Revenue</div>
-      </div>
-    </div>
-    
-    <div class="card">
-      <h3>Quick Stats</h3>
-      <p>Conversion Rate: ${stats.total_users > 0 ? (((stats.premium_users + stats.pro_users) / stats.total_users) * 100).toFixed(1) : 0}%</p>
-      <p>Average Revenue Per User: ${stats.total_users > 0 ? (((stats.premium_users * 2.99) + (stats.pro_users * 9.99)) / stats.total_users).toFixed(2) : 0}</p>
-      <p>Last Updated: ${new Date().toLocaleString()}</p>
-    </div>
-  </body>
-  </html>
-  `;
-  
-  res.send(html);
-});
-
-// Test endpoint for debugging
-app.get('/test', (req, res) => {
-  res.json({
-    message: 'Test endpoint working',
-    timestamp: new Date().toISOString(),
-    version: '2.0.0',
-    endpoints: {
-      webhooks: [
-        'POST /webhook/n8n-callback',
-        'POST /webhook/n8n-error'
-      ],
-      files: [
-        'POST /upload-processed-video',
-        'POST /upload-thumbnail',
-        'GET /downloads/:filename',
-        'GET /thumbs/:filename'
-      ],
-      admin: [
-        'GET /admin/stats',
-        'GET /dashboard'
-      ]
-    },
-    storage: {
-      downloads_dir: './downloads',
-      thumbnails_dir: './thumbnails',
-      temp_dir: './temp'
+    if (videoFiles.error || thumbnailFiles.error) {
+      throw new Error(videoFiles.error?.message || thumbnailFiles.error?.message);
     }
-  });
+
+    const videoSize = videoFiles.data.reduce((sum, file) => sum + (file.metadata?.size || 0), 0);
+    const thumbnailSize = thumbnailFiles.data.reduce((sum, file) => sum + (file.metadata?.size || 0), 0);
+    const totalSize = videoSize + thumbnailSize;
+
+    const usage = {
+      video_files: {
+        count: videoFiles.data.length,
+        total_size_bytes: videoSize,
+        total_size_mb: (videoSize / 1024 / 1024).toFixed(2),
+        total_size_gb: (videoSize / 1024 / 1024 / 1024).toFixed(2)
+      },
+      thumbnails: {
+        count: thumbnailFiles.data.length,
+        total_size_bytes: thumbnailSize,
+        total_size_mb: (thumbnailSize / 1024 / 1024).toFixed(2)
+      },
+      total: {
+        files: videoFiles.data.length + thumbnailFiles.data.length,
+        size_bytes: totalSize,
+        size_mb: (totalSize / 1024 / 1024).toFixed(2),
+        size_gb: (totalSize / 1024 / 1024 / 1024).toFixed(2)
+      },
+      recommendations: {
+        cleanup_needed: (totalSize / 1024 / 1024 / 1024) > 0.5, // 500MB threshold
+        storage_health: (totalSize / 1024 / 1024 / 1024) < 1 ? 'good' : 
+                       (totalSize / 1024 / 1024 / 1024) < 2 ? 'warning' : 'critical',
+        message: (totalSize / 1024 / 1024 / 1024) > 0.5 ? 
+          'Consider running cleanup for files older than 7 days' : 'Storage usage is healthy'
+      },
+      limits: {
+        supabase_free_limit_gb: 1,
+        current_usage_percent: ((totalSize / 1024 / 1024 / 1024) / 1 * 100).toFixed(2)
+      }
+    };
+
+    res.json(usage);
+  } catch (error) {
+    logger.error('Storage usage error', { error: error.message });
+    res.status(500).json({
+      error: 'Failed to get storage usage',
+      message: error.message
+    });
+  }
 });
 
-// Test upload endpoint
-app.get('/test-upload', (req, res) => {
-  res.send(`
+// Enhanced admin endpoints
+app.post('/admin/cleanup-old-files', async (req, res) => {
+  try {
+    const { days = 7, dry_run = false } = req.body;
+    
+    if (!dry_run) {
+      logger.info('Starting file cleanup', { days });
+    }
+    
+    const deletedCount = await db.cleanupOldFiles(days, dry_run);
+    
+    const response = {
+      message: dry_run ? 
+        `Would delete ${deletedCount} files older than ${days} days` :
+        `Cleaned up ${deletedCount} files older than ${days} days`,
+      deleted_count: deletedCount,
+      dry_run,
+      timestamp: new Date().toISOString()
+    };
+    
+    if (!dry_run) {
+      logger.info('File cleanup completed', response);
+    }
+    
+    res.json(response);
+  } catch (error) {
+    logger.error('Cleanup failed', { error: error.message });
+    res.status(500).json({
+      error: 'Cleanup failed',
+      message: error.message
+    });
+  }
+});
+
+app.post('/admin/backup-workflows', async (req, res) => {
+  try {
+    const WorkflowBackup = require('./utils/workflow-backup');
+    const backup = new WorkflowBackup();
+    
+    const backupData = await backup.backupWorkflows();
+    
+    res.json({
+      message: 'Workflows backed up successfully',
+      workflow_count: backupData.workflows.length,
+      timestamp: backupData.timestamp,
+      backup_location: backupData.location
+    });
+  } catch (error) {
+    logger.error('Backup failed', { error: error.message });
+    res.status(500).json({
+      error: 'Backup failed',
+      message: error.message
+    });
+  }
+});
+
+// Enhanced dashboard with real-time data
+app.get('/dashboard', async (req, res) => {
+  try {
+    const [stats, storageUsage] = await Promise.all([
+      db.getStats(),
+      db.getStorageUsage()
+    ]);
+    
+    const html = `
+    <!DOCTYPE html>
     <html>
+    <head>
+      <title>VideoShortsBot Dashboard</title>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        * { box-sizing: border-box; }
+        body { 
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+          margin: 0; padding: 20px; 
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+          min-height: 100vh;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { 
+          background: white; 
+          padding: 30px; 
+          border-radius: 15px; 
+          box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+          margin-bottom: 30px;
+          text-align: center;
+        }
+        .header h1 { 
+          margin: 0; 
+          color: #333; 
+          font-size: 2.5em; 
+          font-weight: 700;
+        }
+        .subtitle { color: #666; margin-top: 10px; font-size: 1.1em; }
+        .grid { 
+          display: grid; 
+          grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); 
+          gap: 20px; 
+          margin-bottom: 30px;
+        }
+        .card { 
+          background: white; 
+          padding: 25px; 
+          border-radius: 15px; 
+          box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+          transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .card:hover { 
+          transform: translateY(-5px); 
+          box-shadow: 0 15px 40px rgba(0,0,0,0.2);
+        }
+        .stat { 
+          font-size: 2.5em; 
+          font-weight: bold; 
+          margin-bottom: 10px;
+          background: linear-gradient(45deg, #667eea, #764ba2);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
+        }
+        .label { color: #666; font-size: 0.9em; text-transform: uppercase; letter-spacing: 1px; }
+        .status { 
+          display: inline-block; 
+          padding: 5px 10px; 
+          border-radius: 20px; 
+          font-size: 0.8em; 
+          font-weight: bold;
+          margin-top: 10px;
+        }
+        .status.healthy { background: #e8f5e8; color: #2e7d2e; }
+        .status.warning { background: #fff3cd; color: #856404; }
+        .status.error { background: #f8d7da; color: #721c24; }
+        .progress-bar {
+          width: 100%;
+          height: 8px;
+          background: #e0e0e0;
+          border-radius: 4px;
+          margin-top: 10px;
+          overflow: hidden;
+        }
+        .progress-fill {
+          height: 100%;
+          background: linear-gradient(90deg, #667eea, #764ba2);
+          border-radius: 4px;
+          transition: width 0.3s ease;
+        }
+        .system-info {
+          background: white;
+          padding: 25px;
+          border-radius: 15px;
+          box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+          margin-top: 20px;
+        }
+        .refresh-btn {
+          position: fixed;
+          bottom: 30px;
+          right: 30px;
+          background: #667eea;
+          color: white;
+          border: none;
+          padding: 15px;
+          border-radius: 50%;
+          font-size: 1.2em;
+          cursor: pointer;
+          box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+          transition: all 0.3s ease;
+        }
+        .refresh-btn:hover {
+          background: #5a67d8;
+          transform: scale(1.1);
+        }
+        @media (max-width: 768px) {
+          .grid { grid-template-columns: 1fr; }
+          .header h1 { font-size: 2em; }
+        }
+      </style>
+      <script>
+        function refreshDashboard() {
+          window.location.reload();
+        }
+        
+        // Auto-refresh every 5 minutes
+        setInterval(refreshDashboard, 300000);
+        
+        // Update timestamp every second
+        setInterval(() => {
+          const now = new Date();
+          document.getElementById('last-updated').textContent = 
+            'Last updated: ' + now.toLocaleTimeString();
+        }, 1000);
+      </script>
+    </head>
     <body>
-      <h2>Test File Upload</h2>
-      <form action="/upload-processed-video" method="post" enctype="multipart/form-data">
-        <input type="text" name="processing_id" placeholder="Processing ID" required><br><br>
-        <input type="text" name="short_id" placeholder="Short ID" required><br><br>
-        <input type="file" name="video" accept="video/*" required><br><br>
-        <button type="submit">Upload Video</button>
-      </form>
+      <div class="container">
+        <div class="header">
+          <h1>📊 VideoShortsBot Analytics</h1>
+          <div class="subtitle" id="last-updated">
+            Last updated: ${new Date().toLocaleTimeString()}
+          </div>
+        </div>
+        
+        <div class="grid">
+          <div class="card">
+            <div class="stat">${stats.users.total}</div>
+            <div class="label">Total Users</div>
+            <div class="status healthy">Growing</div>
+          </div>
+          
+          <div class="card">
+            <div class="stat">${stats.users.premium}</div>
+            <div class="label">Premium Users</div>
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: ${stats.users.total > 0 ? (stats.users.premium / stats.users.total * 100) : 0}%"></div>
+            </div>
+          </div>
+          
+          <div class="card">
+            <div class="stat">${stats.users.pro}</div>
+            <div class="label">Pro Users</div>
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: ${stats.users.total > 0 ? (stats.users.pro / stats.users.total * 100) : 0}%"></div>
+            </div>
+          </div>
+          
+          <div class="card">
+            <div class="stat">${stats.videos.total}</div>
+            <div class="label">Videos Processed</div>
+            <div class="status healthy">All-time</div>
+          </div>
+          
+          <div class="card">
+            <div class="stat">${stats.videos.completed}</div>
+            <div class="label">Successful</div>
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: ${stats.videos.total > 0 ? (stats.videos.completed / stats.videos.total * 100) : 0}%"></div>
+            </div>
+          </div>
+          
+          <div class="card">
+            <div class="stat">${((stats.users.premium * 2.99) + (stats.users.pro * 9.99)).toFixed(0)}</div>
+            <div class="label">Monthly Revenue</div>
+            <div class="status ${((stats.users.premium * 2.99) + (stats.users.pro * 9.99)) > 100 ? 'healthy' : 'warning'}">MRR</div>
+          </div>
+          
+          <div class="card">
+            <div class="stat">${stats.users.total > 0 ? (((stats.users.premium + stats.users.pro) / stats.users.total) * 100).toFixed(1) : 0}%</div>
+            <div class="label">Conversion Rate</div>
+            <div class="status ${stats.users.total > 0 && (((stats.users.premium + stats.users.pro) / stats.users.total) * 100) > 5 ? 'healthy' : 'warning'}">Growth</div>
+          </div>
+          
+          <div class="card">
+            <div class="stat">${storageUsage ? storageUsage.total_size_gb : '0'} GB</div>
+            <div class="label">Storage Used</div>
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: ${storageUsage ? (storageUsage.total_size_gb / 1 * 100) : 0}%"></div>
+            </div>
+            <div class="status ${storageUsage && storageUsage.total_size_gb > 0.8 ? 'warning' : 'healthy'}">
+              ${storageUsage && storageUsage.total_size_gb > 0.8 ? 'High usage' : 'Normal'}
+            </div>
+          </div>
+        </div>
+        
+        <div class="system-info">
+          <h3 style="margin-top: 0; color: #333;">🔧 System Status</h3>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">
+            <div>
+              <strong>Database:</strong> Connected to Supabase<br>
+              <span class="status healthy">Healthy</span>
+            </div>
+            <div>
+              <strong>Storage:</strong> Supabase Storage<br>
+              <span class="status healthy">Active</span>
+            </div>
+            <div>
+              <strong>Processing:</strong> n8n Workflows<br>
+              <span class="status healthy">Running</span>
+            </div>
+            <div>
+              <strong>Uptime:</strong> ${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m<br>
+              <span class="status healthy">Stable</span>
+            </div>
+          </div>
+        </div>
+      </div>
       
-      <form action="/upload-thumbnail" method="post" enctype="multipart/form-data">
-        <input type="text" name="processing_id" placeholder="Processing ID" required><br><br>
-        <input type="text" name="short_id" placeholder="Short ID" required><br><br>
-        <input type="file" name="thumbnail" accept="image/*" required><br><br>
-        <button type="submit">Upload Thumbnail</button>
-      </form>
+      <button class="refresh-btn" onclick="refreshDashboard()" title="Refresh Dashboard">
+        🔄
+      </button>
     </body>
     </html>
-  `);
-});
-
-// API endpoint for checking processing status
-app.get('/api/processing/:processing_id', (req, res) => {
-  const processingId = req.params.processing_id;
-  const job = processingJobs.get(processingId);
-  
-  if (!job) {
-    return res.status(404).json({
-      error: 'Processing job not found',
-      processing_id: processingId,
-      status: 'not_found'
-    });
+    `;
+    
+    res.send(html);
+  } catch (error) {
+    logger.error('Dashboard error', { error: error.message });
+    res.status(500).send(`
+      <html>
+        <body style="font-family: Arial, sans-serif; padding: 50px; text-align: center;">
+          <h1 style="color: #e74c3c;">Dashboard Error</h1>
+          <p>Unable to load dashboard: ${error.message}</p>
+          <button onclick="window.location.reload()" style="padding: 10px 20px; font-size: 16px;">
+            Try Again
+          </button>
+        </body>
+      </html>
+    `);
   }
-  
-  const elapsedTime = Date.now() - job.startTime;
-  const estimatedCompletion = job.subscription_type === 'free' ? 5 * 60 * 1000 : // 5 minutes
-                             job.subscription_type === 'premium' ? 2 * 60 * 1000 : // 2 minutes
-                             1 * 60 * 1000; // 1 minute for pro
-  
-  res.json({
-    processing_id: processingId,
-    status: 'processing',
-    elapsed_time_ms: elapsedTime,
-    estimated_completion_ms: estimatedCompletion,
-    progress: Math.min((elapsedTime / estimatedCompletion) * 100, 95), // Never show 100% until complete
-    subscription_type: job.subscription_type
-  });
 });
 
-// Webhook for payment confirmations (placeholder for Flutterwave integration)
-app.post('/webhook/payment', express.raw({type: 'application/json'}), (req, res) => {
-  console.log('Payment webhook received');
-  
-  // In production, you would:
-  // 1. Verify webhook signature
-  // 2. Update user subscription in database
-  // 3. Send confirmation to user
-  
-  res.json({ status: 'received' });
-});
-
-// 404 handler
+// Enhanced 404 handler
 app.use((req, res) => {
-  console.log(`404 - Route not found: ${req.method} ${req.path}`);
+  logger.warn('Route not found', { method: req.method, path: req.path, ip: req.ip });
   res.status(404).json({
     error: 'Route not found',
     method: req.method,
     path: req.path,
-    available_endpoints: {
-      webhooks: [
-        'POST /webhook/n8n-callback',
-        'POST /webhook/n8n-error',
-        'POST /webhook/payment'
-      ],
-      files: [
-        'POST /upload-processed-video',
-        'POST /upload-thumbnail', 
-        'GET /downloads/:filename',
-        'GET /thumbs/:filename'
-      ],
-      admin: [
-        'GET /',
-        'GET /test',
-        'GET /dashboard',
-        'GET /admin/stats',
-        'GET /test-upload'
-      ],
-      api: [
-        'GET /api/processing/:processing_id'
-      ]
+    available_endpoints: [
+      'GET /health',
+      'GET /metrics',
+      'GET /dashboard',
+      'GET /storage-usage',
+      'POST /webhook/n8n-callback',
+      'POST /upload-processed-video',
+      'POST /upload-thumbnail'
+    ]
+  });
+});
+
+// Enhanced error handler
+app.use((error, req, res, next) => {
+  logger.error('Unhandled error', { 
+    error: error.message, 
+    stack: error.stack,
+    correlationId: req.correlationId,
+    path: req.path,
+    method: req.method
+  });
+
+  // Send alert for critical errors
+  if (error.message.includes('ECONNREFUSED') || error.message.includes('timeout')) {
+    sendAdminAlert('Critical system error detected', error);
+  }
+
+  res.status(500).json({
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong',
+    correlation_id: req.correlationId
+  });
+});
+
+// Graceful shutdown handling
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, starting graceful shutdown...');
+  
+  // Stop accepting new connections
+  server.close(async () => {
+    try {
+      // Stop cron jobs
+      dailyResetJob.stop();
+      
+      // Close database connections
+      if (db.close) await db.close();
+      
+      // Send final admin alert
+      await sendAdminAlert('Bot server shutting down gracefully');
+      
+      logger.info('Graceful shutdown completed');
+      process.exit(0);
+    } catch (error) {
+      logger.error('Error during shutdown', { error: error.message });
+      process.exit(1);
     }
   });
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`🤖 VideoShortsBot Business API v2.0 running on port ${PORT}`);
-  console.log(`🌐 Main URL: https://video-shorts-business-bot.onrender.com`);
-  console.log(`🌐 Webhook URL: https://video-shorts-business-bot.onrender.com/webhook/n8n-callback`);
-  console.log(`🌐 Error Webhook: https://video-shorts-business-bot.onrender.com/webhook/n8n-error`);
-  console.log(`🌐 Dashboard: https://video-shorts-business-bot.onrender.com/dashboard`);
-  console.log(`📁 File Storage: Enabled (downloads, thumbnails)`);
-  console.log(`👥 Current Users: ${users.size}`);
-  console.log(`⚙️ Processing Jobs: ${processingJobs.size}`);
+process.on('SIGINT', async () => {
+  logger.info('SIGINT received, shutting down gracefully...');
+  process.kill(process.pid, 'SIGTERM');
 });
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception', { error: error.message, stack: error.stack });
+  sendAdminAlert('Uncaught exception in bot server', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection', { reason, promise });
+  sendAdminAlert('Unhandled promise rejection in bot server', new Error(reason));
+});
+
+// Start server
+const PORT = process.env.PORT || 10000;
+const server = app.listen(PORT, () => {
+  logger.info('🤖 VideoShortsBot server started', {
+    port: PORT,
+    environment: process.env.NODE_ENV || 'development',
+    dashboard_url: `https://video-shorts-business-bot.onrender.com/dashboard`,
+    database: 'Supabase',
+    storage: 'Supabase Storage',
+    node_version: process.version
+  });
+  
+  // Initialize workflow backup system
+  try {
+    const WorkflowBackup = require('./utils/workflow-backup');
+    const backup = new WorkflowBackup();
+    backup.startScheduledBackups();
+    logger.info('Workflow backup system initialized');
+  } catch (error) {
+    logger.warn('Workflow backup system not available', { error: error.message });
+  }
+});
+
+module.exports = { app, bot, server, userService, processingQueue };
