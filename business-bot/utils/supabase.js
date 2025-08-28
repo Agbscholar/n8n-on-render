@@ -21,9 +21,10 @@ class SupabaseDB {
   // Test connection
   async testConnection() {
     try {
+      // Simple health check that doesn't depend on specific tables
       const { data, error } = await this.supabase
         .from('users')
-        .select('count(*)')
+        .select('telegram_id')
         .limit(1);
       
       if (error) {
