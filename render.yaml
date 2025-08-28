@@ -1,0 +1,49 @@
+services:
+  # Your existing n8n service (keep this unchanged)
+  - type: web
+    name: n8n-workflow-service
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: N8N_BASIC_AUTH_ACTIVE
+        value: "true"
+      - key: N8N_BASIC_AUTH_USER
+        sync: false
+      - key: N8N_BASIC_AUTH_PASSWORD
+        sync: false
+      - key: WEBHOOK_URL
+        value: "https://n8n-on-render-wf30.onrender.com"
+
+  # New business bot service with Supabase
+  - type: web
+    name: video-shorts-business-bot
+    env: node
+    plan: free
+    rootDir: ./business-bot
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: N8N_URL
+        value: "https://n8n-on-render-wf30.onrender.com"
+      - key: N8N_WEBHOOK_SECRET
+        value: "7f9d0d2e8a6f4f38a13a2bcf5b6d441b91c9d26e8b72714d2edcf7c4e2a843ke"
+      - key: RENDER_EXTERNAL_URL
+        value: "https://video-shorts-business-bot.onrender.com"
+      - key: ENABLE_WORKFLOW_BACKUPS
+        value: "true"
