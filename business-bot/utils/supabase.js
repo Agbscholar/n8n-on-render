@@ -8,8 +8,35 @@ class SupabaseDB {
     
     this.supabase = createClient(
       process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY
+      process.env.SUPABASE_SERVICE_ROLE_KEY,
+      {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false
+        }
+      }
     );
+  }
+
+  // Test connection
+  async testConnection() {
+    try {
+      const { data, error } = await this.supabase
+        .from('users')
+        .select('count(*)')
+        .limit(1);
+      
+      if (error) {
+        console.error('Supabase connection test failed:', error);
+        return false;
+      }
+      
+      console.log('Supabase connection successful');
+      return true;
+    } catch (error) {
+      console.error('Supabase connection error:', error);
+      return false;
+    }
   }
 
   // User management
@@ -22,6 +49,7 @@ class SupabaseDB {
         .single();
 
       if (error && error.code !== 'PGRST116') {
+        console.error('Error getting user:', error);
         throw error;
       }
       
@@ -52,7 +80,10 @@ class SupabaseDB {
         .select()
         .single();
 
-      if (error) throw error;
+      if (error) {
+        console.error('Error creating user:', error);
+        throw error;
+      }
       return data;
     } catch (error) {
       console.error('Error creating user:', error);
@@ -72,7 +103,10 @@ class SupabaseDB {
         .select()
         .single();
 
-      if (error) throw error;
+      if (error) {
+        console.error('Error updating user:', error);
+        throw error;
+      }
       return data;
     } catch (error) {
       console.error('Error updating user:', error);
@@ -106,26 +140,51 @@ class SupabaseDB {
     }
   }
 
-async incrementUsage(telegramId) {
-  try {
-    const { data, error } = await this.supabase
-      .rpc('increment_usage', { user_telegram_id: telegramId });
-
-    if (error) throw error;
-    return data;
-  } catch (error) {
-    console.error('Error incrementing usage:', error);
-    throw error;
-  }
-}
-
-  async decrementUsage(telegramId) {
+  async incrementUsage(telegramId) {
     try {
+      // First try using RPC function
+      const { data: rpcData, error: rpcError } = await this.supabase
+        .rpc('increment_usage', { user_telegram_id: telegramId });
+
+      if (!rpcError) {
+        return rpcData;
+      }
+
+      // Fallback to manual increment
+      console.log('RPC failed, using manual increment');
+      const user = await this.getUser(telegramId);
+      if (!user) throw new Error('User not found');
+
       const { data, error } = await this.supabase
         .from('users')
         .update({
-          daily_usage: this.supabase.raw('GREATEST(daily_usage - 1, 0)'),
-          total_usage: this.supabase.raw('GREATEST(total_usage - 1, 0)'),
+          daily_usage: user.daily_usage + 1,
+          total_usage: user.total_usage + 1,
+          updated_at: new Date().toISOString()
+        })
+        .eq('telegram_id', telegramId)
+        .select()
+        .single();
+
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      console.error('Error incrementing usage:', error);
+      throw error;
+    }
+  }
+
+  // Fixed decrementUsage method - removed invalid supabase.raw()
+  async decrementUsage(telegramId) {
+    try {
+      const user = await this.getUser(telegramId);
+      if (!user) throw new Error('User not found');
+
+      const { data, error } = await this.supabase
+        .from('users')
+        .update({
+          daily_usage: Math.max(user.daily_usage - 1, 0),
+          total_usage: Math.max(user.total_usage - 1, 0),
           updated_at: new Date().toISOString()
         })
         .eq('telegram_id', telegramId)
@@ -144,8 +203,12 @@ async incrementUsage(telegramId) {
     try {
       const { data, error } = await this.supabase
         .from('users')
-        .update({ daily_usage: 0, updated_at: new Date().toISOString() })
-        .neq('daily_usage', 0);
+        .update({ 
+          daily_usage: 0, 
+          updated_at: new Date().toISOString() 
+        })
+        .neq('daily_usage', 0)
+        .select();
 
       if (error) throw error;
       console.log(`Reset daily usage for ${data?.length || 0} users`);
@@ -399,4 +462,15 @@ async incrementUsage(telegramId) {
   }
 }
 
-module.exports = new SupabaseDB();
+// Initialize and test connection
+const supabaseDB = new SupabaseDB();
+
+// Test connection on startup
+supabaseDB.testConnection().then(success => {
+  if (!success) {
+    console.error('Failed to connect to Supabase - check your environment variables');
+    process.exit(1);
+  }
+});
+
+module.exports = supabaseDB;
