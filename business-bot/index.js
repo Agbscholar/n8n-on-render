@@ -192,6 +192,8 @@ app.get('/', (req, res) => {
 });
 
 const PORT = process.env.PORT || 5678;
+ 
+const HOST = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost';
 app.listen(PORT, () => {
   console.log(`🤖 Bot running on port ${PORT}`);
 });
