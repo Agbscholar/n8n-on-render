@@ -7,12 +7,26 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {polling: true});
 
 // Middleware
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// In-memory storage for demo (replace with database in production)
+// Add request logging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  console.log('Headers:', req.headers);
+  console.log('Body:', req.body);
+  next();
+});
+
+// In-memory storage
 const users = new Map();
 const processingJobs = new Map();
 
-// Initialize or get user
+// Keep the service awake (ping itself every 14 minutes)
+setInterval(() => {
+  axios.get('https://video-shorts-business-bot.onrender.com/')
+    .catch(err => console.log('Self-ping failed:', err.message));
+}, 14 * 60 * 1000);
+
 function initUser(telegramId, userInfo) {
   if (!users.has(telegramId)) {
     users.set(telegramId, {
@@ -28,7 +42,6 @@ function initUser(telegramId, userInfo) {
   return users.get(telegramId);
 }
 
-// Check if user can process videos
 function canProcessVideo(telegramId) {
   const user = users.get(telegramId);
   if (!user) return false;
@@ -40,7 +53,6 @@ function canProcessVideo(telegramId) {
   return user.daily_usage < 3;
 }
 
-// Update user usage
 function updateUsage(telegramId) {
   const user = users.get(telegramId);
   if (user) {
@@ -49,10 +61,12 @@ function updateUsage(telegramId) {
   }
 }
 
-// Start command
+// Bot commands
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   const user = initUser(msg.from.id, msg.from);
+  
+  console.log(`New user: ${msg.from.id}, Chat: ${chatId}`);
   
   const welcomeMessage = `🎬 Welcome to VideoShortsBot!
 
@@ -84,7 +98,6 @@ Commands:
   bot.sendMessage(chatId, welcomeMessage);
 });
 
-// Stats command
 bot.onText(/\/stats/, (msg) => {
   const user = users.get(msg.from.id);
   
@@ -109,7 +122,6 @@ ${user.subscription_type === 'free' ?
   bot.sendMessage(msg.chat.id, statsMessage);
 });
 
-// Upgrade command
 bot.onText(/\/upgrade/, (msg) => {
   const upgradeMessage = `💎 UPGRADE YOUR EXPERIENCE
 
@@ -130,7 +142,6 @@ Contact @Osezblessed to upgrade!`;
   bot.sendMessage(msg.chat.id, upgradeMessage);
 });
 
-// Help command
 bot.onText(/\/help/, (msg) => {
   const helpMessage = `❓ HOW TO USE VIDEOSHORTSBOT
 
@@ -160,10 +171,8 @@ Need help? Contact @Osezblessed`;
 
 // Handle video URLs
 bot.on('message', async (msg) => {
-  // Skip commands
   if (msg.text && msg.text.startsWith('/')) return;
   
-  // Check for video URLs
   if (msg.text && (msg.text.includes('youtube.com') || msg.text.includes('youtu.be') || 
                    msg.text.includes('tiktok.com') || msg.text.includes('instagram.com') ||
                    msg.text.includes('vm.tiktok.com') || msg.text.includes('twitter.com'))) {
@@ -172,10 +181,10 @@ bot.on('message', async (msg) => {
     const telegramId = msg.from.id;
     const videoUrl = msg.text.trim();
     
-    // Initialize user if not exists
+    console.log(`Processing video request from user ${telegramId}, chat ${chatId}: ${videoUrl}`);
+    
     const user = initUser(telegramId, msg.from);
     
-    // Check limits
     if (!canProcessVideo(telegramId)) {
       const limitMessage = `🚫 Daily limit reached!
 
@@ -192,19 +201,17 @@ Contact @Osezblessed to upgrade!`;
       return bot.sendMessage(chatId, limitMessage);
     }
     
-    // Check Instagram restriction for free users
     if (user.subscription_type === 'free' && videoUrl.includes('instagram.com')) {
       return bot.sendMessage(chatId, '🔒 Instagram processing requires Premium subscription. Contact @Osezblessed to upgrade!');
     }
     
-    // Send processing message
     bot.sendMessage(chatId, '🎬 Processing your video... This may take 1-3 minutes.');
     
-    // Update usage
     updateUsage(telegramId);
     
     try {
-      // Call n8n workflow
+      console.log('Calling n8n workflow...');
+      
       const response = await axios.post('https://n8n-on-render-wf30.onrender.com/webhook/video-processing', {
         telegram_id: telegramId,
         chat_id: chatId,
@@ -214,15 +221,14 @@ Contact @Osezblessed to upgrade!`;
         webhook_secret: '7f9d0d2e8a6f4f38a13a2bcf5b6d441b91c9d26e8b72714d2edcf7c4e2a843ke',
         business_bot_url: 'https://video-shorts-business-bot.onrender.com'
       }, {
-        timeout: 10000,
+        timeout: 30000,
         headers: {
           'Content-Type': 'application/json'
         }
       });
       
-      console.log('n8n response:', response.data);
+      console.log('n8n workflow response:', response.data);
       
-      // Store processing job
       if (response.data.processing_id) {
         processingJobs.set(response.data.processing_id, {
           telegramId,
@@ -230,10 +236,21 @@ Contact @Osezblessed to upgrade!`;
           videoUrl,
           startTime: Date.now()
         });
+        
+        // Set a fallback timeout in case callback never arrives
+        setTimeout(() => {
+          if (processingJobs.has(response.data.processing_id)) {
+            console.log(`Timeout for processing ${response.data.processing_id}`);
+            bot.sendMessage(chatId, `⏰ Processing is taking longer than expected. Please wait a bit more or try again.
+
+If the issue persists, contact @Osezblessed`);
+            processingJobs.delete(response.data.processing_id);
+          }
+        }, 5 * 60 * 1000); // 5 minute timeout
       }
       
     } catch (error) {
-      console.error('Error calling n8n:', error.message);
+      console.error('Error calling n8n workflow:', error.message);
       
       bot.sendMessage(chatId, `❌ Processing failed: ${error.message}
 
@@ -250,9 +267,11 @@ Contact @Osezblessed to upgrade!`;
   }
 });
 
-// Webhook endpoint to receive n8n callbacks
+// WEBHOOK ENDPOINTS - These are what n8n calls back to
+
+// Primary callback endpoint (matches your n8n workflow)
 app.post('/webhook/n8n-callback', async (req, res) => {
-  console.log('Received n8n callback:', req.body);
+  console.log('📨 Received n8n callback:', JSON.stringify(req.body, null, 2));
   
   try {
     const {
@@ -262,46 +281,56 @@ app.post('/webhook/n8n-callback', async (req, res) => {
       status,
       shorts_results,
       total_shorts,
-      subscription_type
+      subscription_type,
+      processing_completed_at
     } = req.body;
     
-    // Validate required fields
-    if (!telegram_id || !chat_id) {
+    // Convert to numbers if they're strings
+    const telegramIdNum = parseInt(telegram_id);
+    const chatIdNum = parseInt(chat_id);
+    
+    console.log(`Processing callback - Status: ${status}, Telegram: ${telegramIdNum}, Chat: ${chatIdNum}`);
+    
+    if (!telegramIdNum || !chatIdNum) {
+      console.error('Missing or invalid telegram_id/chat_id:', { telegram_id, chat_id });
       return res.status(400).json({
         status: 'error',
-        message: 'Missing telegram_id or chat_id'
+        message: 'Missing or invalid telegram_id or chat_id'
       });
     }
     
-    if (status === 'completed' && shorts_results) {
-      // Parse shorts_results if it's a string
+    if (status === 'completed') {
       let results;
       try {
         results = typeof shorts_results === 'string' ? JSON.parse(shorts_results) : shorts_results;
       } catch (e) {
-        results = shorts_results;
+        results = shorts_results || [];
       }
       
-      // Send success message
+      if (!Array.isArray(results)) {
+        results = [results];
+      }
+      
       let message = `✅ Your ${total_shorts || results.length} shorts are ready!
 
 🎬 Processing completed successfully
 📱 Quality: ${results[0]?.quality || '720p'}
-⏱️ Platform: Auto-detected
+⏱️ Processing time: ${processing_completed_at ? 'Just completed' : 'Unknown'}
 
 📥 Download links:`;
       
-      // Add download links
-      if (Array.isArray(results)) {
-        results.forEach((short, index) => {
-          message += `\n\n🎥 Short ${index + 1}: ${short.title || 'Video Short'}`;
-          if (short.file_url) {
-            message += `\n📎 ${short.file_url}`;
-          }
-        });
-      }
+      results.forEach((short, index) => {
+        message += `\n\n🎥 Short ${index + 1}: ${short.title || 'Video Short'}`;
+        if (short.file_url && short.file_url !== 'https://example.com/test.mp4') {
+          message += `\n📎 ${short.file_url}`;
+        } else {
+          message += `\n📎 [Demo mode - no actual file]`;
+        }
+        if (short.thumbnail_url) {
+          message += `\n🖼️ Thumbnail: ${short.thumbnail_url}`;
+        }
+      });
       
-      // Add upgrade message for free users
       if (subscription_type === 'free') {
         message += `\n\n🚀 Upgrade to Premium for:
 • 🎯 HD Quality (1080p)
@@ -312,15 +341,26 @@ app.post('/webhook/n8n-callback', async (req, res) => {
 Contact @Osezblessed to upgrade!`;
       }
       
-      await bot.sendMessage(chat_id, message);
+      await bot.sendMessage(chatIdNum, message);
+      console.log(`✅ Success message sent to chat ${chatIdNum}`);
       
-    } else if (status === 'error') {
-      await bot.sendMessage(chat_id, `❌ Processing failed
+    } else if (status === 'error' || status === 'failed') {
+      await bot.sendMessage(chatIdNum, `❌ Processing failed
 
 Please try again or contact @Osezblessed for support.`);
+      console.log(`❌ Error message sent to chat ${chatIdNum}`);
     }
     
-    res.json({ status: 'success', message: 'Callback processed' });
+    // Clean up processing job
+    if (processing_id) {
+      processingJobs.delete(processing_id);
+    }
+    
+    res.json({ 
+      status: 'success', 
+      message: 'Callback processed successfully',
+      processed_for: chatIdNum
+    });
     
   } catch (error) {
     console.error('Error processing callback:', error);
@@ -332,32 +372,42 @@ Please try again or contact @Osezblessed for support.`);
   }
 });
 
-// Error webhook endpoint
+// Error callback endpoint
 app.post('/webhook/n8n-error', async (req, res) => {
-  console.log('Received n8n error:', req.body);
+  console.log('📨 Received n8n error callback:', JSON.stringify(req.body, null, 2));
   
   try {
-    const { telegram_id, chat_id, error_message } = req.body;
+    const { telegram_id, chat_id, error_message, processing_id } = req.body;
     
-    if (chat_id) {
-      await bot.sendMessage(chat_id, `❌ Video Processing Failed
+    const chatIdNum = parseInt(chat_id);
+    const telegramIdNum = parseInt(telegram_id);
+    
+    if (chatIdNum) {
+      await bot.sendMessage(chatIdNum, `❌ Video Processing Failed
 
 🔍 Error: ${error_message || 'Unknown error occurred'}
 
 🔄 What to do:
 • Check if the video URL is valid
 • Try again in a few minutes
-• Contact @Osezblessed if the issue persists`);
+• Contact @Osezblessed if the issue persists
+
+Processing ID: ${processing_id || 'N/A'}`);
       
       // Revert usage count on error
-      const user = users.get(parseInt(telegram_id));
+      const user = users.get(telegramIdNum);
       if (user && user.daily_usage > 0) {
         user.daily_usage -= 1;
         user.total_usage -= 1;
       }
     }
     
-    res.json({ status: 'success' });
+    // Clean up processing job
+    if (processing_id) {
+      processingJobs.delete(processing_id);
+    }
+    
+    res.json({ status: 'success', message: 'Error callback processed' });
     
   } catch (error) {
     console.error('Error processing error callback:', error);
@@ -365,13 +415,25 @@ app.post('/webhook/n8n-error', async (req, res) => {
   }
 });
 
-// Health check
+// Health check endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'VideoShortsBot Business API Running',
     timestamp: new Date(),
     users: users.size,
-    processing_jobs: processingJobs.size
+    processing_jobs: processingJobs.size,
+    uptime: process.uptime()
+  });
+});
+
+// Test endpoint for debugging
+app.get('/test', (req, res) => {
+  res.json({
+    message: 'Test endpoint working',
+    webhook_urls: [
+      'POST /webhook/n8n-callback',
+      'POST /webhook/n8n-error'
+    ]
   });
 });
 
@@ -381,25 +443,38 @@ app.get('/admin/stats', (req, res) => {
     total_users: users.size,
     premium_users: Array.from(users.values()).filter(u => u.subscription_type !== 'free').length,
     total_videos_processed: Array.from(users.values()).reduce((sum, u) => sum + u.total_usage, 0),
-    active_processing_jobs: processingJobs.size
+    active_processing_jobs: processingJobs.size,
+    users_list: Array.from(users.entries()).map(([id, user]) => ({
+      telegram_id: id,
+      name: user.first_name,
+      subscription: user.subscription_type,
+      daily_usage: user.daily_usage
+    }))
   };
   
   res.json(stats);
 });
 
-// Reset daily usage at midnight (simple version)
-setInterval(() => {
-  const now = new Date();
-  if (now.getHours() === 0 && now.getMinutes() === 0) {
-    users.forEach(user => {
-      user.daily_usage = 0;
-    });
-    console.log('Daily usage reset for all users');
-  }
-}, 60000); // Check every minute
+// 404 handler
+app.use((req, res) => {
+  console.log(`404 - Route not found: ${req.method} ${req.path}`);
+  res.status(404).json({
+    error: 'Route not found',
+    method: req.method,
+    path: req.path,
+    available_endpoints: [
+      'GET /',
+      'GET /test',
+      'GET /admin/stats',
+      'POST /webhook/n8n-callback',
+      'POST /webhook/n8n-error'
+    ]
+  });
+});
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🤖 VideoShortsBot Business API running on port ${PORT}`);
   console.log(`🌐 Webhook URL: https://video-shorts-business-bot.onrender.com/webhook/n8n-callback`);
+  console.log(`🌐 Error Webhook URL: https://video-shorts-business-bot.onrender.com/webhook/n8n-error`);
 });
