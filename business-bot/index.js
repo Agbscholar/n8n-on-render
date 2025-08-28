@@ -242,7 +242,13 @@ async function sendAdminAlert(message, error = null) {
 }
 
 // Enhanced bot commands with better error handling and rate limiting
-bot.onText(/\/start(?:\s+(.+))?/, rateLimiter, async (msg, match) => {
+bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
+  // Apply rate limiting
+  const rateLimiter = require('./middleware/rateLimiter');
+  const canProceed = await rateLimiter(msg);
+  if (!canProceed) return;
+  
+  
   const chatId = msg.chat.id;
   const telegramId = msg.from.id;
   
@@ -319,7 +325,13 @@ Commands:
   }
 });
 
-bot.onText(/\/stats/, rateLimiter, async (msg) => {
+bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
+  // Apply rate limiting
+  const rateLimiter = require('./middleware/rateLimiter');
+  const canProceed = await rateLimiter(msg);
+  if (!canProceed) return;
+  
+  
   const telegramId = msg.from.id;
   const chatId = msg.chat.id;
   
@@ -361,7 +373,12 @@ ${user.subscription_type === 'free' ?
   }
 });
 
-bot.onText(/\/upgrade/, (msg) => {
+bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
+  // Apply rate limiting
+  const rateLimiter = require('./middleware/rateLimiter');
+  const canProceed = await rateLimiter(msg);
+  if (!canProceed) return;
+  
   const upgradeMessage = `💎 UPGRADE YOUR EXPERIENCE
 
 🇳🇬 NIGERIAN PRICING:
@@ -1403,6 +1420,21 @@ app.get('/dashboard', async (req, res) => {
   }
 });
 
+
+app.get('/', (req, res) => {
+  res.json({
+    service: 'VideoShortsBot Business API',
+    status: 'running',
+    version: '2.0.0',
+    endpoints: {
+      dashboard: '/dashboard',
+      health: '/health',
+      metrics: '/metrics'
+    }
+  });
+});
+
+
 // Enhanced 404 handler
 app.use((req, res) => {
   logger.warn('Route not found', { method: req.method, path: req.path, ip: req.ip });
@@ -1443,6 +1475,9 @@ app.use((error, req, res, next) => {
     correlation_id: req.correlationId
   });
 });
+
+
+
 
 // Graceful shutdown handling
 process.on('SIGTERM', async () => {

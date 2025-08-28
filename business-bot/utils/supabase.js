@@ -2,6 +2,10 @@ const { createClient } = require('@supabase/supabase-js');
 
 class SupabaseDB {
   constructor() {
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      throw new Error('Missing Supabase environment variables');
+    }
+    
     this.supabase = createClient(
       process.env.SUPABASE_URL,
       process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -102,26 +106,18 @@ class SupabaseDB {
     }
   }
 
-  async incrementUsage(telegramId) {
-    try {
-      const { data, error } = await this.supabase
-        .from('users')
-        .update({
-          daily_usage: this.supabase.raw('daily_usage + 1'),
-          total_usage: this.supabase.raw('total_usage + 1'),
-          updated_at: new Date().toISOString()
-        })
-        .eq('telegram_id', telegramId)
-        .select()
-        .single();
+async incrementUsage(telegramId) {
+  try {
+    const { data, error } = await this.supabase
+      .rpc('increment_usage', { user_telegram_id: telegramId });
 
-      if (error) throw error;
-      return data;
-    } catch (error) {
-      console.error('Error incrementing usage:', error);
-      throw error;
-    }
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error incrementing usage:', error);
+    throw error;
   }
+}
 
   async decrementUsage(telegramId) {
     try {

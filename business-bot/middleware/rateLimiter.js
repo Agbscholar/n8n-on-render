@@ -250,8 +250,11 @@ Please wait ${resetIn} seconds before trying again.
 // Create singleton instance
 const rateLimiter = new RateLimiter();
 
-// Export both the instance and middleware
-module.exports = rateLimiter.createTelegramMiddleware();
+// Export middleware function directly
+module.exports = (msg, metadata) => {
+  return rateLimiter.createTelegramMiddleware()(msg, metadata);
+};
+
+// Export additional methods
 module.exports.rateLimiter = rateLimiter;
-module.exports.expressMiddleware = rateLimiter.createExpressMiddleware();
-module.exports.customExpressMiddleware = (options) => rateLimiter.createExpressMiddleware(options);
+module.exports.expressMiddleware = (req, res, next) => rateLimiter.createExpressMiddleware()(req, res, next);
