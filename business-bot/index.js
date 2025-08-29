@@ -241,13 +241,158 @@ async function sendAdminAlert(message, error = null) {
   }
 }
 
+// FIXED: Enhanced video processing queue with per-user limits
+class VideoProcessingQueue {
+  constructor() {
+    this.userProcessing = new Map(); // Track per-user processing count
+    this.processing = new Map(); // Track processing ID to user mapping
+    this.maxPerUser = {
+      free: 1,     // 1 concurrent video per free user
+      premium: 3,  // 3 concurrent videos per premium user
+      pro: 5       // 5 concurrent videos per pro user
+    };
+    this.maxGlobal = {
+      free: 10,    // Global limit for free users
+      premium: 20, // Global limit for premium users
+      pro: 50      // Global limit for pro users
+    };
+    this.globalProcessing = {
+      free: 0,
+      premium: 0,
+      pro: 0
+    };
+  }
+
+  canProcess(telegramId, subscriptionType) {
+    // Check per-user limit
+    const userCount = this.userProcessing.get(telegramId) || 0;
+    if (userCount >= this.maxPerUser[subscriptionType]) {
+      logger.warn('User processing limit reached', { telegramId, userCount, limit: this.maxPerUser[subscriptionType] });
+      return false;
+    }
+
+    // Check global limit for subscription type
+    if (this.globalProcessing[subscriptionType] >= this.maxGlobal[subscriptionType]) {
+      logger.warn('Global processing limit reached', { 
+        subscriptionType, 
+        current: this.globalProcessing[subscriptionType], 
+        limit: this.maxGlobal[subscriptionType] 
+      });
+      return false;
+    }
+
+    return true;
+  }
+
+  startProcessing(processingId, telegramId, subscriptionType) {
+    // Increment user count
+    const userCount = this.userProcessing.get(telegramId) || 0;
+    this.userProcessing.set(telegramId, userCount + 1);
+    
+    // Increment global count
+    this.globalProcessing[subscriptionType]++;
+    
+    // Store processing info
+    this.processing.set(processingId, { 
+      telegramId, 
+      subscriptionType,
+      startTime: Date.now()
+    });
+    
+    logger.info('Processing started', { 
+      processingId, 
+      telegramId, 
+      subscriptionType,
+      userCount: userCount + 1,
+      globalCount: this.globalProcessing[subscriptionType]
+    });
+  }
+
+  finishProcessing(processingId) {
+    const processInfo = this.processing.get(processingId);
+    if (processInfo) {
+      const { telegramId, subscriptionType } = processInfo;
+      
+      // Decrement user count
+      const userCount = this.userProcessing.get(telegramId) || 0;
+      if (userCount > 0) {
+        this.userProcessing.set(telegramId, userCount - 1);
+        if (userCount - 1 === 0) {
+          this.userProcessing.delete(telegramId);
+        }
+      }
+      
+      // Decrement global count
+      if (this.globalProcessing[subscriptionType] > 0) {
+        this.globalProcessing[subscriptionType]--;
+      }
+      
+      // Remove processing info
+      this.processing.delete(processingId);
+      
+      const processingTime = Date.now() - processInfo.startTime;
+      logger.info('Processing finished', { 
+        processingId, 
+        telegramId, 
+        subscriptionType,
+        processingTimeMs: processingTime,
+        remainingUserCount: this.userProcessing.get(telegramId) || 0,
+        remainingGlobalCount: this.globalProcessing[subscriptionType]
+      });
+    } else {
+      logger.warn('Attempted to finish unknown processing', { processingId });
+    }
+  }
+
+  // Clean up stale processing entries (older than 30 minutes)
+  cleanupStaleProcessing() {
+    const thirtyMinutesAgo = Date.now() - (30 * 60 * 1000);
+    const staleEntries = [];
+    
+    for (const [processingId, processInfo] of this.processing.entries()) {
+      if (processInfo.startTime < thirtyMinutesAgo) {
+        staleEntries.push(processingId);
+      }
+    }
+    
+    for (const processingId of staleEntries) {
+      logger.warn('Cleaning up stale processing entry', { processingId });
+      this.finishProcessing(processingId);
+    }
+    
+    return staleEntries.length;
+  }
+
+  getStatus() {
+    return {
+      userProcessing: Object.fromEntries(this.userProcessing),
+      globalProcessing: this.globalProcessing,
+      totalActive: this.processing.size,
+      activeProcesses: Array.from(this.processing.entries()).map(([id, info]) => ({
+        id,
+        telegramId: info.telegramId,
+        subscriptionType: info.subscriptionType,
+        duration: Date.now() - info.startTime
+      }))
+    };
+  }
+}
+
+const processingQueue = new VideoProcessingQueue();
+
+// Clean up stale processing every 5 minutes
+setInterval(() => {
+  const cleaned = processingQueue.cleanupStaleProcessing();
+  if (cleaned > 0) {
+    logger.info(`Cleaned up ${cleaned} stale processing entries`);
+  }
+}, 5 * 60 * 1000);
+
 // Enhanced bot commands with better error handling and rate limiting
 bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
   // Apply rate limiting
-  const rateLimiter = require('./middleware/rateLimiter');
   const canProceed = await rateLimiter(msg);
   if (!canProceed) return;
-  
   
   const chatId = msg.chat.id;
   const telegramId = msg.from.id;
@@ -325,12 +470,9 @@ Commands:
   }
 });
 
-bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
-  // Apply rate limiting
-  const rateLimiter = require('./middleware/rateLimiter');
+bot.onText(/\/stats/, async (msg) => {
   const canProceed = await rateLimiter(msg);
   if (!canProceed) return;
-  
   
   const telegramId = msg.from.id;
   const chatId = msg.chat.id;
@@ -373,9 +515,7 @@ ${user.subscription_type === 'free' ?
   }
 });
 
-bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
-  // Apply rate limiting
-  const rateLimiter = require('./middleware/rateLimiter');
+bot.onText(/\/upgrade/, async (msg) => {
   const canProceed = await rateLimiter(msg);
   if (!canProceed) return;
   
@@ -417,43 +557,7 @@ Contact @Osezblessed to upgrade!`;
   bot.sendMessage(msg.chat.id, upgradeMessage, {reply_markup: keyboard});
 });
 
-// Enhanced video processing with queue management
-class VideoProcessingQueue {
-  constructor() {
-    this.processing = new Map();
-    this.maxConcurrent = {
-      free: 2,
-      premium: 5,
-      pro: 10
-    };
-    this.currentProcessing = {
-      free: 0,
-      premium: 0,
-      pro: 0
-    };
-  }
-
-  canProcess(subscriptionType) {
-    return this.currentProcessing[subscriptionType] < this.maxConcurrent[subscriptionType];
-  }
-
-  startProcessing(processingId, subscriptionType) {
-    this.processing.set(processingId, subscriptionType);
-    this.currentProcessing[subscriptionType]++;
-  }
-
-  finishProcessing(processingId) {
-    const subscriptionType = this.processing.get(processingId);
-    if (subscriptionType) {
-      this.processing.delete(processingId);
-      this.currentProcessing[subscriptionType]--;
-    }
-  }
-}
-
-const processingQueue = new VideoProcessingQueue();
-
-// Enhanced video URL processing
+// Enhanced video URL processing with proper queue management
 bot.on('message', async (msg) => {
   if (msg.text && msg.text.startsWith('/')) return;
   
@@ -463,6 +567,7 @@ bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
     const videoUrl = msg.text.trim();
+    let processingId = null;
     
     logger.info('Processing video request', { telegramId, videoUrl });
     
@@ -493,15 +598,30 @@ Contact @Osezblessed to upgrade instantly!`;
         }
       }
 
-      // Check processing queue
-      if (!processingQueue.canProcess(user.subscription_type)) {
-        return bot.sendMessage(chatId, '⏳ Processing queue is full. Please try again in a few minutes.');
+      // FIXED: Check processing queue with proper parameters
+      if (!processingQueue.canProcess(telegramId, user.subscription_type)) {
+        const queueStatus = processingQueue.getStatus();
+        const userProcessingCount = queueStatus.userProcessing[telegramId] || 0;
+        
+        let queueMessage = '';
+        if (userProcessingCount >= processingQueue.maxPerUser[user.subscription_type]) {
+          queueMessage = `⏳ You already have ${userProcessingCount} video(s) processing. Please wait for them to complete.
+
+Your limit: ${processingQueue.maxPerUser[user.subscription_type]} concurrent videos
+${user.subscription_type === 'free' ? '\n💎 Upgrade to Premium for higher limits!' : ''}`;
+        } else {
+          queueMessage = `⏳ Processing queue is full for ${user.subscription_type} users. Please try again in a few minutes.
+
+Current global load: ${queueStatus.globalProcessing[user.subscription_type]}/${processingQueue.maxGlobal[user.subscription_type]}`;
+        }
+        
+        return bot.sendMessage(chatId, queueMessage);
       }
       
-      const processingId = `proc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      processingId = `proc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       
-      // Start processing
-      processingQueue.startProcessing(processingId, user.subscription_type);
+      // FIXED: Start processing with proper parameters
+      processingQueue.startProcessing(processingId, telegramId, user.subscription_type);
       
       const processingMessages = {
         free: '🎬 Processing your video... This may take 2-5 minutes.',
@@ -596,7 +716,11 @@ Contact @Osezblessed to upgrade instantly!`;
 Error code: ${error.response?.status || 'NETWORK_ERROR'}`);
       
       await userService.revertUsage(telegramId);
-      processingQueue.finishProcessing(processingId);
+      
+      // FIXED: Only finish processing if processingId was created
+      if (processingId) {
+        processingQueue.finishProcessing(processingId);
+      }
       
       await db.logUsage({
         telegram_id: telegramId,
@@ -765,7 +889,7 @@ app.post('/webhook/n8n-callback', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
     
-    // Finish processing queue
+    // FIXED: Finish processing queue properly
     processingQueue.finishProcessing(processing_id);
     
     const videoRecord = await db.updateVideo(processing_id, {
@@ -897,8 +1021,9 @@ app.get('/health', async (req, res) => {
         platform: process.platform
       },
       processing: {
-        queue_status: processingQueue.currentProcessing,
-        max_concurrent: processingQueue.maxConcurrent
+        queue_status: processingQueue.getStatus(),
+        max_concurrent_per_user: processingQueue.maxPerUser,
+        max_global: processingQueue.maxGlobal
       }
     };
 
@@ -996,6 +1121,7 @@ app.get('/health', async (req, res) => {
 app.get('/metrics', async (req, res) => {
   try {
     const stats = await db.getStats();
+    const queueStatus = processingQueue.getStatus();
     
     const metrics = {
       timestamp: new Date().toISOString(),
@@ -1028,7 +1154,7 @@ app.get('/metrics', async (req, res) => {
         memory_usage: process.memoryUsage(),
         node_version: process.version,
         platform: process.platform,
-        processing_queue: processingQueue.currentProcessing
+        processing_queue: queueStatus
       },
       performance: {
         response_times: {
@@ -1166,6 +1292,30 @@ app.post('/admin/backup-workflows', async (req, res) => {
   }
 });
 
+// Enhanced queue status endpoint for debugging
+app.get('/queue-status', async (req, res) => {
+  try {
+    const queueStatus = processingQueue.getStatus();
+    const cleanedStale = processingQueue.cleanupStaleProcessing();
+    
+    res.json({
+      queue_status: queueStatus,
+      cleaned_stale_entries: cleanedStale,
+      limits: {
+        per_user: processingQueue.maxPerUser,
+        global: processingQueue.maxGlobal
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    logger.error('Queue status error', { error: error.message });
+    res.status(500).json({
+      error: 'Failed to get queue status',
+      message: error.message
+    });
+  }
+});
+
 // Enhanced dashboard with real-time data
 app.get('/dashboard', async (req, res) => {
   try {
@@ -1173,6 +1323,8 @@ app.get('/dashboard', async (req, res) => {
       db.getStats(),
       db.getStorageUsage()
     ]);
+    
+    const queueStatus = processingQueue.getStatus();
     
     const html = `
     <!DOCTYPE html>
@@ -1258,6 +1410,13 @@ app.get('/dashboard', async (req, res) => {
           transition: width 0.3s ease;
         }
         .system-info {
+          background: white;
+          padding: 25px;
+          border-radius: 15px;
+          box-shadow: 0 8px 25px rgba(0,0,0,0.15);
+          margin-top: 20px;
+        }
+        .queue-info {
           background: white;
           padding: 25px;
           border-radius: 15px;
@@ -1371,6 +1530,42 @@ app.get('/dashboard', async (req, res) => {
               ${storageUsage && storageUsage.total_size_gb > 0.8 ? 'High usage' : 'Normal'}
             </div>
           </div>
+          
+          <div class="card">
+            <div class="stat">${queueStatus.totalActive}</div>
+            <div class="label">Processing Queue</div>
+            <div class="status ${queueStatus.totalActive > 20 ? 'warning' : 'healthy'}">
+              ${queueStatus.totalActive > 20 ? 'High load' : 'Normal'}
+            </div>
+          </div>
+        </div>
+        
+        <div class="queue-info">
+          <h3 style="margin-top: 0; color: #333;">🔄 Processing Queue Status</h3>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px;">
+            <div>
+              <strong>Free Users:</strong> ${queueStatus.globalProcessing.free}/10<br>
+              <span class="status ${queueStatus.globalProcessing.free > 8 ? 'warning' : 'healthy'}">
+                ${queueStatus.globalProcessing.free > 8 ? 'High load' : 'Normal'}
+              </span>
+            </div>
+            <div>
+              <strong>Premium Users:</strong> ${queueStatus.globalProcessing.premium}/20<br>
+              <span class="status ${queueStatus.globalProcessing.premium > 15 ? 'warning' : 'healthy'}">
+                ${queueStatus.globalProcessing.premium > 15 ? 'High load' : 'Normal'}
+              </span>
+            </div>
+            <div>
+              <strong>Pro Users:</strong> ${queueStatus.globalProcessing.pro}/50<br>
+              <span class="status ${queueStatus.globalProcessing.pro > 40 ? 'warning' : 'healthy'}">
+                ${queueStatus.globalProcessing.pro > 40 ? 'High load' : 'Normal'}
+              </span>
+            </div>
+            <div>
+              <strong>Active Processes:</strong> ${queueStatus.totalActive}<br>
+              <span class="status healthy">Real-time</span>
+            </div>
+          </div>
         </div>
         
         <div class="system-info">
@@ -1420,7 +1615,6 @@ app.get('/dashboard', async (req, res) => {
   }
 });
 
-
 app.get('/', (req, res) => {
   res.json({
     service: 'VideoShortsBot Business API',
@@ -1429,11 +1623,11 @@ app.get('/', (req, res) => {
     endpoints: {
       dashboard: '/dashboard',
       health: '/health',
-      metrics: '/metrics'
+      metrics: '/metrics',
+      queue_status: '/queue-status'
     }
   });
 });
-
 
 // Enhanced 404 handler
 app.use((req, res) => {
@@ -1447,6 +1641,7 @@ app.use((req, res) => {
       'GET /metrics',
       'GET /dashboard',
       'GET /storage-usage',
+      'GET /queue-status',
       'POST /webhook/n8n-callback',
       'POST /upload-processed-video',
       'POST /upload-thumbnail'
@@ -1475,9 +1670,6 @@ app.use((error, req, res, next) => {
     correlation_id: req.correlationId
   });
 });
-
-
-
 
 // Graceful shutdown handling
 process.on('SIGTERM', async () => {
