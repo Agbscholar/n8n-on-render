@@ -867,9 +867,16 @@ app.post('/upload-thumbnail', upload.single('thumbnail'), async (req, res) => {
 
 // Enhanced webhook callback handling
 app.post('/webhook/n8n-callback', async (req, res) => {
-  logger.info('Received n8n callback', { body: req.body });
+  logger.info('Received n8n callback', { 
+    body: req.body,
+    headers: req.headers,
+    contentType: req.headers['content-type']
+  });
   
   try {
+    const callbackData = req.body;
+    
+    // ENHANCED: Extract and validate required fields with better error handling
     const {
       processing_id,
       telegram_id,
@@ -878,130 +885,292 @@ app.post('/webhook/n8n-callback', async (req, res) => {
       shorts_results,
       total_shorts,
       subscription_type,
-      processing_completed_at
-    } = req.body;
+      processing_completed_at,
+      video_info,
+      platform
+    } = callbackData;
     
-    const telegramIdNum = parseInt(telegram_id);
-    const chatIdNum = parseInt(chat_id);
+    // CORRECTED: Better validation with specific error messages
+    const requiredFields = { processing_id, telegram_id, chat_id };
+    const missingFields = [];
     
-    if (!telegramIdNum || !chatIdNum || !processing_id) {
-      logger.error('Invalid callback data', { telegram_id, chat_id, processing_id });
-      return res.status(400).json({ error: 'Missing required fields' });
+    for (const [field, value] of Object.entries(requiredFields)) {
+      if (!value || value === 'undefined' || value === 'null' || String(value).trim() === '') {
+        missingFields.push(field);
+      }
     }
     
-    // FIXED: Finish processing queue properly
-    processingQueue.finishProcessing(processing_id);
+    if (missingFields.length > 0) {
+      const errorDetails = {
+        missingFields,
+        receivedData: callbackData,
+        availableFields: Object.keys(callbackData),
+        debug_info: callbackData.debug_info || 'Not provided'
+      };
+      
+      logger.error('Invalid callback data - missing required fields', errorDetails);
+      return res.status(400).json({ 
+        error: `Missing required fields: ${missingFields.join(', ')}`,
+        details: errorDetails
+      });
+    }
     
-    const videoRecord = await db.updateVideo(processing_id, {
-      status: status === 'completed' ? 'completed' : 'failed',
-      completed_at: status === 'completed' ? new Date().toISOString() : null,
-      error_message: status === 'failed' ? req.body.error_message : null
+    // FIXED: Robust ID conversion with validation
+    let telegramIdNum, chatIdNum;
+    
+    try {
+      telegramIdNum = parseInt(String(telegram_id).trim());
+      chatIdNum = parseInt(String(chat_id).trim());
+      
+      if (isNaN(telegramIdNum) || isNaN(chatIdNum)) {
+        throw new Error('Invalid ID format');
+      }
+    } catch (parseError) {
+      logger.error('Failed to parse IDs', { 
+        telegram_id, 
+        chat_id, 
+        error: parseError.message 
+      });
+      return res.status(400).json({ 
+        error: 'Invalid telegram_id or chat_id format',
+        received: { telegram_id, chat_id }
+      });
+    }
+    
+    logger.info('Processing callback', {
+      processingId: processing_id,
+      telegramId: telegramIdNum,
+      chatId: chatIdNum,
+      status
     });
     
+    // FIXED: Finish processing queue properly (ensure this matches the processing_id)
+    processingQueue.finishProcessing(processing_id);
+    
+    // ENHANCED: Update video record with better error handling
+    let videoRecord;
+    try {
+      videoRecord = await db.updateVideo(processing_id, {
+        status: status === 'completed' ? 'completed' : 'failed',
+        completed_at: status === 'completed' ? new Date().toISOString() : null,
+        error_message: status === 'failed' ? 
+          (callbackData.error_message || 'Processing failed') : null
+      });
+    } catch (dbError) {
+      logger.error('Failed to update video record', {
+        processingId: processing_id,
+        error: dbError.message
+      });
+      // Continue processing even if DB update fails
+    }
+    
     if (status === 'completed') {
-      let results;
+      // CORRECTED: Handle shorts_results parsing more robustly
+      let results = [];
       try {
-        results = typeof shorts_results === 'string' ? JSON.parse(shorts_results) : shorts_results;
-      } catch (e) {
-        results = shorts_results || [];
+        if (typeof shorts_results === 'string') {
+          results = JSON.parse(shorts_results);
+        } else if (Array.isArray(shorts_results)) {
+          results = shorts_results;
+        } else if (shorts_results && typeof shorts_results === 'object') {
+          results = [shorts_results];
+        } else {
+          logger.warn('No valid shorts_results provided', { shorts_results });
+        }
+      } catch (parseError) {
+        logger.error('Failed to parse shorts_results', { 
+          shorts_results, 
+          error: parseError.message 
+        });
+        results = [];
       }
       
-      if (!Array.isArray(results)) results = [results];
+      if (!Array.isArray(results)) {
+        results = [results];
+      }
       
-      // Save shorts to database with enhanced error handling
-      for (const short of results) {
+      // ENHANCED: Save shorts to database with transaction-like behavior
+      const savedShorts = [];
+      for (const [index, short] of results.entries()) {
         try {
-          await db.createShort({
-            video_id: videoRecord.id,
-            short_id: short.short_id,
-            title: short.title,
-            file_url: short.file_url,
-            thumbnail_url: short.thumbnail_url,
-            duration: short.duration,
-            quality: short.quality,
-            file_size: short.file_size ? parseInt(short.file_size) : null,
-            features_applied: short.features_applied || [],
-            watermark: short.watermark
-          });
+          if (videoRecord?.id) {
+            const savedShort = await db.createShort({
+              video_id: videoRecord.id,
+              short_id: short.short_id || `short_${processing_id}_${index + 1}`,
+              title: short.title || `Video Short ${index + 1}`,
+              file_url: short.file_url || null,
+              thumbnail_url: short.thumbnail_url || null,
+              duration: short.duration ? parseInt(short.duration) : null,
+              quality: short.quality || '720p',
+              file_size: short.file_size ? 
+                parseInt(String(short.file_size).replace(/[^\d]/g, '')) : null,
+              features_applied: short.features_applied || [],
+              watermark: short.watermark || null
+            });
+            savedShorts.push(savedShort);
+          }
         } catch (shortError) {
           logger.error('Failed to save short', { 
             shortId: short.short_id, 
+            index,
             error: shortError.message 
           });
         }
       }
       
-      let message = `✅ Your ${total_shorts || results.length} shorts are ready!
+      // CORRECTED: Build success message with proper validation
+      const shortsCount = total_shorts || results.length || 0;
+      const quality = results[0]?.quality || '720p';
+      
+      let message = `✅ Your ${shortsCount} short${shortsCount !== 1 ? 's' : ''} ${shortsCount !== 1 ? 'are' : 'is'} ready!
 
 🎬 Processing completed successfully
-📱 Quality: ${results[0]?.quality || '720p'}
+📱 Quality: ${quality}
+🎯 Platform: ${platform || 'Unknown'}
 ⏱️ Processing time: Just completed
 
 📥 Download links:`;
       
+      // Add individual short details
       results.forEach((short, index) => {
-        message += `\n\n🎥 Short ${index + 1}: ${short.title || 'Video Short'}`;
-        if (short.file_url && !short.file_url.includes('demo.videoshortsbot.com')) {
+        const shortTitle = short.title || `Video Short ${index + 1}`;
+        message += `\n\n🎥 Short ${index + 1}: ${shortTitle}`;
+        
+        if (short.file_url && 
+            !short.file_url.includes('demo.videoshortsbot.com') && 
+            !short.file_url.includes('placeholder')) {
           message += `\n📎 ${short.file_url}`;
         } else {
-          message += `\n📎 [Processing complete - file will be available shortly]`;
+          message += `\n📎 [File will be available shortly]`;
         }
+        
         if (short.duration) {
           message += `\n⏱️ Duration: ${short.duration}s`;
         }
+        
+        if (short.watermark) {
+          message += `\n💧 Watermark: ${short.watermark}`;
+        }
       });
       
+      // Add subscription-specific messaging
       if (subscription_type === 'free') {
-        message += `\n\n🚀 Upgrade to Premium for HD quality and no watermarks!
-Contact @Osezblessed to upgrade!`;
+        message += `\n\n🚀 Upgrade to Premium for:\n• HD Quality (1080p)\n• No Watermarks\n• More Shorts per Video\n• Priority Processing\n\nContact @Osezblessed to upgrade!`;
+      } else if (subscription_type === 'premium') {
+        message += `\n\n💎 Premium features applied:\n• High Quality Processing\n• No Watermarks\n• Priority Queue`;
+      } else if (subscription_type === 'pro') {
+        message += `\n\n🚀 Pro features applied:\n• Maximum Quality\n• Advanced Processing\n• Priority Support`;
       }
       
-      await bot.sendMessage(chatIdNum, message);
+      // FIXED: Send message with proper error handling
+      try {
+        await bot.sendMessage(chatIdNum, message);
+        logger.info('Success message sent', { chatId: chatIdNum, shortsCount });
+      } catch (telegramError) {
+        logger.error('Failed to send success message', { 
+          chatId: chatIdNum, 
+          error: telegramError.message 
+        });
+        // Don't fail the entire callback if message sending fails
+      }
       
-      // Log successful completion
-      await db.logUsage({
-        telegram_id: telegramIdNum,
-        video_id: videoRecord.id,
-        processing_id: processing_id,
-        action: 'video_processing_completed',
-        success: true,
-        processing_time: processing_completed_at ? 
-          Math.floor((new Date(processing_completed_at) - new Date(videoRecord.created_at)) / 1000) : null
-      });
+      // ENHANCED: Log successful completion with metrics
+      try {
+        await db.logUsage({
+          telegram_id: telegramIdNum,
+          video_id: videoRecord?.id || null,
+          processing_id: processing_id,
+          action: 'video_processing_completed',
+          success: true,
+          processing_time: processing_completed_at ? 
+            Math.floor((new Date(processing_completed_at) - new Date(videoRecord?.created_at || new Date())) / 1000) : null,
+          shorts_generated: results.length,
+          platform: platform || 'Unknown'
+        });
+      } catch (logError) {
+        logger.warn('Failed to log completion', { error: logError.message });
+      }
       
     } else if (status === 'error' || status === 'failed') {
-      const errorMsg = `❌ Processing failed
-
-${req.body.error_message || 'Unknown error occurred'}
-
-🔄 What to try:
-• Check if video URL is accessible
-• Try a shorter video
-• Wait a few minutes and try again
-
-Contact @Osezblessed if this persists.`;
-
-      await bot.sendMessage(chatIdNum, errorMsg);
+      // CORRECTED: Handle error cases properly
+      const errorMessage = callbackData.error_message || 
+                          callbackData.message || 
+                          'Unknown error occurred during processing';
       
-      // Revert usage for failed processing
-      await userService.revertUsage(telegramIdNum);
+      const errorMsg = `❌ Processing Failed
+
+🔍 Error: ${errorMessage}
+
+🔄 What you can do:
+• Check if the video URL is accessible
+• Try a shorter video (under 10 minutes)
+• Wait a few minutes and try again
+• Make sure the video is public
+
+📞 Still having issues? Contact @Osezblessed
+
+📝 Reference ID: ${processing_id}`;
+
+      try {
+        await bot.sendMessage(chatIdNum, errorMsg);
+        logger.info('Error message sent', { chatId: chatIdNum });
+      } catch (telegramError) {
+        logger.error('Failed to send error message', { 
+          chatId: chatIdNum, 
+          error: telegramError.message 
+        });
+      }
+      
+      // CORRECTED: Revert usage for failed processing
+      try {
+        await userService.revertUsage(telegramIdNum);
+        logger.info('Usage reverted for failed processing', { telegramId: telegramIdNum });
+      } catch (revertError) {
+        logger.error('Failed to revert usage', { 
+          telegramId: telegramIdNum, 
+          error: revertError.message 
+        });
+      }
       
       // Log failed completion
-      await db.logUsage({
-        telegram_id: telegramIdNum,
-        video_id: videoRecord?.id,
-        processing_id: processing_id,
-        action: 'video_processing_failed',
-        success: false,
-        error_message: req.body.error_message
-      });
+      try {
+        await db.logUsage({
+          telegram_id: telegramIdNum,
+          video_id: videoRecord?.id || null,
+          processing_id: processing_id,
+          action: 'video_processing_failed',
+          success: false,
+          error_message: errorMessage,
+          platform: platform || 'Unknown'
+        });
+      } catch (logError) {
+        logger.warn('Failed to log error', { error: logError.message });
+      }
     }
     
-    res.json({ status: 'success', message: 'Callback processed' });
+    res.json({ 
+      status: 'success', 
+      message: 'Callback processed successfully',
+      processing_id,
+      telegram_id: telegramIdNum,
+      processed_status: status
+    });
     
   } catch (error) {
-    logger.error('Error processing callback', { error: error.message });
-    res.status(500).json({ error: 'Failed to process callback', details: error.message });
+    logger.error('Critical error processing callback', { 
+      error: error.message, 
+      stack: error.stack,
+      body: req.body
+    });
+    
+    // Send admin alert for critical callback errors
+    await sendAdminAlert(`Critical callback processing error: ${error.message}`, error);
+    
+    res.status(500).json({ 
+      error: 'Failed to process callback', 
+      details: error.message,
+      correlation_id: req.correlationId
+    });
   }
 });
 
