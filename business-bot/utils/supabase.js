@@ -1,90 +1,62 @@
 const { createClient } = require('@supabase/supabase-js');
 
-class SupabaseDB {
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY;
+
+if (!supabaseUrl || !supabaseServiceKey) {
+  throw new Error('Missing Supabase environment variables');
+}
+
+const supabase = createClient(supabaseUrl, supabaseServiceKey, {
+  auth: { persistSession: false }
+});
+
+class DatabaseService {
   constructor() {
-    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
-      throw new Error('Missing Supabase environment variables');
-    }
-    
-    this.supabase = createClient(
-      process.env.SUPABASE_URL,
-      process.env.SUPABASE_SERVICE_ROLE_KEY,
-      {
-        auth: {
-          autoRefreshToken: false,
-          persistSession: false
-        }
-      }
-    );
+    this.supabase = supabase;
   }
 
-  // Test connection
-  async testConnection() {
-    try {
-      // Simple health check that doesn't depend on specific tables
-      const { data, error } = await this.supabase
-        .from('users')
-        .select('telegram_id')
-        .limit(1);
-      
-      if (error) {
-        console.error('Supabase connection test failed:', error);
-        return false;
-      }
-      
-      console.log('Supabase connection successful');
-      return true;
-    } catch (error) {
-      console.error('Supabase connection error:', error);
-      return false;
-    }
-  }
-
-  // User management
+  // USERS METHODS
   async getUser(telegramId) {
     try {
-      const { data, error } = await this.supabase
+      const { data, error } = await supabase
         .from('users')
         .select('*')
         .eq('telegram_id', telegramId)
         .single();
 
       if (error && error.code !== 'PGRST116') {
-        console.error('Error getting user:', error);
         throw error;
       }
-      
+
       return data;
     } catch (error) {
       console.error('Error getting user:', error);
-      return null;
+      throw error;
     }
   }
 
   async createUser(userData) {
     try {
-      const { telegram_id, username, first_name } = userData;
-      const referralCode = `REF${telegram_id}`;
+      // Generate referral code
+      const referralCode = `REF${userData.telegram_id}`;
       
-      const { data, error } = await this.supabase
+      const { data, error } = await supabase
         .from('users')
-        .upsert({
-          telegram_id,
-          username,
-          first_name,
-          referral_code: referralCode,
+        .insert([{
+          telegram_id: userData.telegram_id,
+          username: userData.username,
+          first_name: userData.first_name,
           subscription_type: 'free',
           daily_usage: 0,
           total_usage: 0,
+          referral_code: referralCode,
           referred_users: 0
-        })
+        }])
         .select()
         .single();
 
-      if (error) {
-        console.error('Error creating user:', error);
-        throw error;
-      }
+      if (error) throw error;
       return data;
     } catch (error) {
       console.error('Error creating user:', error);
@@ -94,20 +66,14 @@ class SupabaseDB {
 
   async updateUser(telegramId, updates) {
     try {
-      const { data, error } = await this.supabase
+      const { data, error } = await supabase
         .from('users')
-        .update({
-          ...updates,
-          updated_at: new Date().toISOString()
-        })
+        .update({ ...updates, updated_at: new Date().toISOString() })
         .eq('telegram_id', telegramId)
         .select()
         .single();
 
-      if (error) {
-        console.error('Error updating user:', error);
-        throw error;
-      }
+      if (error) throw error;
       return data;
     } catch (error) {
       console.error('Error updating user:', error);
@@ -115,26 +81,28 @@ class SupabaseDB {
     }
   }
 
+  // Usage checking and limits
   async canUseService(telegramId) {
     try {
       const user = await this.getUser(telegramId);
       if (!user) return false;
-      
-      // Premium/Pro users have unlimited access if subscription is valid
-      if (user.subscription_type === 'premium' || user.subscription_type === 'pro') {
-        if (user.subscription_expires && new Date() < new Date(user.subscription_expires)) {
-          return true;
-        } else if (user.subscription_expires && new Date() >= new Date(user.subscription_expires)) {
-          // Subscription expired, downgrade to free
-          await this.updateUser(telegramId, {
-            subscription_type: 'free',
-            subscription_expires: null
-          });
-        }
-      }
-      
-      // Free users have daily limits
-      return user.daily_usage < 3;
+
+      // Premium and Pro users have unlimited access
+      if (user.subscription_type !== 'free') return true;
+
+      // Free users: check daily limit
+      const { data: todayUsage, error } = await supabase
+        .from('usage_logs')
+        .select('id')
+        .eq('telegram_id', telegramId)
+        .eq('action', 'video_processing_completed')
+        .eq('success', true)
+        .gte('created_at', new Date().toISOString().split('T')[0] + 'T00:00:00.000Z')
+        .lt('created_at', new Date(Date.now() + 24*60*60*1000).toISOString().split('T')[0] + 'T00:00:00.000Z');
+
+      if (error) throw error;
+
+      return (todayUsage?.length || 0) < 3; // Free limit is 3 per day
     } catch (error) {
       console.error('Error checking service usage:', error);
       return false;
@@ -143,24 +111,11 @@ class SupabaseDB {
 
   async incrementUsage(telegramId) {
     try {
-      // First try using RPC function
-      const { data: rpcData, error: rpcError } = await this.supabase
-        .rpc('increment_usage', { user_telegram_id: telegramId });
-
-      if (!rpcError) {
-        return rpcData;
-      }
-
-      // Fallback to manual increment
-      console.log('RPC failed, using manual increment');
-      const user = await this.getUser(telegramId);
-      if (!user) throw new Error('User not found');
-
-      const { data, error } = await this.supabase
+      const { data, error } = await supabase
         .from('users')
-        .update({
-          daily_usage: user.daily_usage + 1,
-          total_usage: user.total_usage + 1,
+        .update({ 
+          daily_usage: supabase.raw('daily_usage + 1'),
+          total_usage: supabase.raw('total_usage + 1'),
           updated_at: new Date().toISOString()
         })
         .eq('telegram_id', telegramId)
@@ -175,17 +130,12 @@ class SupabaseDB {
     }
   }
 
-  // Fixed decrementUsage method - removed invalid supabase.raw()
   async decrementUsage(telegramId) {
     try {
-      const user = await this.getUser(telegramId);
-      if (!user) throw new Error('User not found');
-
-      const { data, error } = await this.supabase
+      const { data, error } = await supabase
         .from('users')
-        .update({
-          daily_usage: Math.max(user.daily_usage - 1, 0),
-          total_usage: Math.max(user.total_usage - 1, 0),
+        .update({ 
+          daily_usage: supabase.raw('GREATEST(daily_usage - 1, 0)'),
           updated_at: new Date().toISOString()
         })
         .eq('telegram_id', telegramId)
@@ -202,17 +152,16 @@ class SupabaseDB {
 
   async resetDailyUsage() {
     try {
-      const { data, error } = await this.supabase
+      const { data, error } = await supabase
         .from('users')
         .update({ 
-          daily_usage: 0, 
-          updated_at: new Date().toISOString() 
+          daily_usage: 0,
+          updated_at: new Date().toISOString()
         })
-        .neq('daily_usage', 0)
-        .select();
+        .neq('daily_usage', 0); // Only update users with non-zero usage
 
       if (error) throw error;
-      console.log(`Reset daily usage for ${data?.length || 0} users`);
+      console.log('Daily usage reset completed');
       return data;
     } catch (error) {
       console.error('Error resetting daily usage:', error);
@@ -220,19 +169,24 @@ class SupabaseDB {
     }
   }
 
-  // Video management
+  // VIDEO PROCESSING METHODS (Updated for current schema)
   async createVideo(videoData) {
     try {
-      const { data, error } = await this.supabase
-        .from('videos')
-        .insert({
+      // Get user ID first
+      const user = await this.getUser(videoData.telegram_id);
+      if (!user) throw new Error('User not found');
+
+      const { data, error } = await supabase
+        .from('video_processing')
+        .insert([{
           processing_id: videoData.processing_id,
+          user_id: user.id,
           telegram_id: videoData.telegram_id,
           original_url: videoData.video_url,
           platform: videoData.platform,
-          title: videoData.title || null,
-          status: 'processing'
-        })
+          status: 'processing',
+          subscription_type: user.subscription_type
+        }])
         .select()
         .single();
 
@@ -246,12 +200,9 @@ class SupabaseDB {
 
   async updateVideo(processingId, updates) {
     try {
-      const { data, error } = await this.supabase
-        .from('videos')
-        .update({
-          ...updates,
-          updated_at: new Date().toISOString()
-        })
+      const { data, error } = await supabase
+        .from('video_processing')
+        .update({ ...updates, updated_at: new Date().toISOString() })
         .eq('processing_id', processingId)
         .select()
         .single();
@@ -266,26 +217,41 @@ class SupabaseDB {
 
   async getVideo(processingId) {
     try {
-      const { data, error } = await this.supabase
-        .from('videos')
-        .select('*, shorts(*)')
+      const { data, error } = await supabase
+        .from('video_processing')
+        .select('*')
         .eq('processing_id', processingId)
         .single();
 
-      if (error) throw error;
+      if (error && error.code !== 'PGRST116') {
+        throw error;
+      }
+
       return data;
     } catch (error) {
       console.error('Error getting video:', error);
-      return null;
+      throw error;
     }
   }
 
-  // Shorts management
+  // SHORT VIDEOS METHODS (Updated for current schema)
   async createShort(shortData) {
     try {
-      const { data, error } = await this.supabase
-        .from('shorts')
-        .insert(shortData)
+      const { data, error } = await supabase
+        .from('short_videos')
+        .insert([{
+          short_id: shortData.short_id,
+          video_processing_id: shortData.video_id, // Map to correct column
+          user_id: shortData.user_id || (await this.getVideo(shortData.processing_id))?.user_id,
+          title: shortData.title,
+          duration: shortData.duration,
+          quality: shortData.quality,
+          file_url: shortData.file_url,
+          thumbnail_url: shortData.thumbnail_url,
+          file_size_mb: shortData.file_size ? parseFloat(shortData.file_size) / (1024 * 1024) : null,
+          features_applied: shortData.features_applied || [],
+          status: 'completed'
+        }])
         .select()
         .single();
 
@@ -297,71 +263,12 @@ class SupabaseDB {
     }
   }
 
-  async updateShort(shortId, updates) {
-    try {
-      const { data, error } = await this.supabase
-        .from('shorts')
-        .update(updates)
-        .eq('short_id', shortId)
-        .select()
-        .single();
-
-      if (error) throw error;
-      return data;
-    } catch (error) {
-      console.error('Error updating short:', error);
-      throw error;
-    }
-  }
-
-  // File storage methods
-  async uploadFile(bucket, filePath, fileBuffer, contentType) {
-    try {
-      const { data, error } = await this.supabase.storage
-        .from(bucket)
-        .upload(filePath, fileBuffer, {
-          contentType,
-          upsert: true
-        });
-
-      if (error) throw error;
-      
-      // Get public URL
-      const { data: { publicUrl } } = this.supabase.storage
-        .from(bucket)
-        .getPublicUrl(filePath);
-
-      return {
-        path: data.path,
-        fullPath: data.fullPath,
-        publicUrl
-      };
-    } catch (error) {
-      console.error('Error uploading file:', error);
-      throw error;
-    }
-  }
-
-  async deleteFile(bucket, filePath) {
-    try {
-      const { data, error } = await this.supabase.storage
-        .from(bucket)
-        .remove([filePath]);
-
-      if (error) throw error;
-      return data;
-    } catch (error) {
-      console.error('Error deleting file:', error);
-      throw error;
-    }
-  }
-
-  // Usage logging
+  // USAGE LOGS METHODS (Fixed to match current schema)
   async logUsage(logData) {
     try {
-      const { data, error } = await this.supabase
+      const { data, error } = await supabase
         .from('usage_logs')
-        .insert({
+        .insert([{
           telegram_id: logData.telegram_id,
           video_id: logData.video_id || null,
           processing_id: logData.processing_id || null,
@@ -369,109 +276,218 @@ class SupabaseDB {
           platform: logData.platform || null,
           processing_time: logData.processing_time || null,
           success: logData.success !== false,
-          error_message: logData.error_message || null
-        });
+          error_message: logData.error_message || null,
+          shorts_generated: logData.shorts_generated || 0
+        }])
+        .select()
+        .single();
 
       if (error) throw error;
       return data;
     } catch (error) {
       console.error('Error logging usage:', error);
-      // Don't throw error for logging failures
+      // Don't throw - logging failures shouldn't break main flow
       return null;
     }
   }
 
-  // Analytics methods
-  async getStats() {
+  // REFERRAL SYSTEM
+  async processReferral(referrerId, newUserId) {
     try {
-      // Get user counts by subscription type
-      const { data: userStats, error: userError } = await this.supabase
+      const { data: referrer } = await supabase
         .from('users')
-        .select('subscription_type');
-
-      if (userError) throw userError;
-
-      // Get total videos processed
-      const { data: videoStats, error: videoError } = await this.supabase
-        .from('videos')
-        .select('status');
-
-      if (videoError) throw videoError;
-
-      // Get recent activity
-      const { data: recentLogs, error: logsError } = await this.supabase
-        .from('usage_logs')
         .select('*')
-        .order('created_at', { ascending: false })
-        .limit(100);
+        .eq('telegram_id', referrerId)
+        .single();
 
-      if (logsError) throw logsError;
+      if (referrer) {
+        await supabase
+          .from('users')
+          .update({ 
+            referred_users: supabase.raw('referred_users + 1'),
+            updated_at: new Date().toISOString()
+          })
+          .eq('telegram_id', referrerId);
 
-      const stats = {
-        users: {
-          total: userStats.length,
-          free: userStats.filter(u => u.subscription_type === 'free').length,
-          premium: userStats.filter(u => u.subscription_type === 'premium').length,
-          pro: userStats.filter(u => u.subscription_type === 'pro').length
-        },
-        videos: {
-          total: videoStats.length,
-          completed: videoStats.filter(v => v.status === 'completed').length,
-          processing: videoStats.filter(v => v.status === 'processing').length,
-          failed: videoStats.filter(v => v.status === 'failed').length
-        },
-        recent_activity: recentLogs
-      };
-
-      return stats;
+        await this.logUsage({
+          telegram_id: newUserId,
+          action: 'referral_processed',
+          success: true,
+          metadata: { referrer_id: referrerId }
+        });
+      }
     } catch (error) {
-      console.error('Error getting stats:', error);
+      console.error('Error processing referral:', error);
       throw error;
     }
   }
 
-  // Cleanup old files (for maintenance)
-  async cleanupOldFiles(daysOld = 7) {
+  // STORAGE METHODS
+  async uploadFile(bucketName, filePath, fileBuffer, contentType) {
     try {
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - daysOld);
+      const { data, error } = await supabase.storage
+        .from(bucketName)
+        .upload(filePath, fileBuffer, {
+          contentType: contentType,
+          duplex: 'half'
+        });
 
-      const { data: oldVideos, error } = await this.supabase
-        .from('videos')
-        .select('file_path, thumbnail_path')
+      if (error) throw error;
+
+      const { data: publicData } = supabase.storage
+        .from(bucketName)
+        .getPublicUrl(filePath);
+
+      return {
+        ...data,
+        publicUrl: publicData.publicUrl
+      };
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      throw error;
+    }
+  }
+
+  // STATISTICS AND ANALYTICS
+  async getStats() {
+    try {
+      const [usersResult, videosResult, usageResult] = await Promise.all([
+        supabase
+          .from('users')
+          .select('subscription_type')
+          .not('subscription_type', 'is', null),
+        supabase
+          .from('video_processing')
+          .select('status'),
+        supabase
+          .from('usage_logs')
+          .select('success, created_at')
+          .gte('created_at', new Date(Date.now() - 24*60*60*1000).toISOString())
+      ]);
+
+      const users = usersResult.data || [];
+      const videos = videosResult.data || [];
+      const usage = usageResult.data || [];
+
+      return {
+        users: {
+          total: users.length,
+          free: users.filter(u => u.subscription_type === 'free').length,
+          premium: users.filter(u => u.subscription_type === 'premium').length,
+          pro: users.filter(u => u.subscription_type === 'pro').length,
+          active_today: usage.length
+        },
+        videos: {
+          total: videos.length,
+          completed: videos.filter(v => v.status === 'completed').length,
+          processing: videos.filter(v => v.status === 'processing').length,
+          failed: videos.filter(v => v.status === 'failed').length
+        },
+        usage: {
+          today_total: usage.length,
+          today_success: usage.filter(u => u.success).length,
+          today_failed: usage.filter(u => !u.success).length
+        }
+      };
+    } catch (error) {
+      console.error('Error getting stats:', error);
+      return {
+        users: { total: 0, free: 0, premium: 0, pro: 0, active_today: 0 },
+        videos: { total: 0, completed: 0, processing: 0, failed: 0 },
+        usage: { today_total: 0, today_success: 0, today_failed: 0 }
+      };
+    }
+  }
+
+  async getStorageUsage() {
+    try {
+      const { data: videoFiles, error: videoError } = await supabase.storage
+        .from('video-files')
+        .list('', { limit: 1000 });
+
+      const { data: thumbnailFiles, error: thumbnailError } = await supabase.storage
+        .from('thumbnails')
+        .list('', { limit: 1000 });
+
+      if (videoError || thumbnailError) {
+        throw new Error(videoError?.message || thumbnailError?.message);
+      }
+
+      const videoSize = (videoFiles || []).reduce((sum, file) => sum + (file.metadata?.size || 0), 0);
+      const thumbnailSize = (thumbnailFiles || []).reduce((sum, file) => sum + (file.metadata?.size || 0), 0);
+      const totalSize = videoSize + thumbnailSize;
+
+      return {
+        video_files: videoFiles?.length || 0,
+        thumbnail_files: thumbnailFiles?.length || 0,
+        total_files: (videoFiles?.length || 0) + (thumbnailFiles?.length || 0),
+        total_size_bytes: totalSize,
+        total_size_mb: (totalSize / (1024 * 1024)).toFixed(2),
+        total_size_gb: (totalSize / (1024 * 1024 * 1024)).toFixed(3)
+      };
+    } catch (error) {
+      console.error('Error getting storage usage:', error);
+      return null;
+    }
+  }
+
+  // CLEANUP METHODS
+  async cleanupOldFiles(days = 7, dryRun = false) {
+    try {
+      const cutoffDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      
+      const { data: oldVideos, error } = await supabase
+        .from('video_processing')
+        .select('id, processing_id')
         .lt('created_at', cutoffDate.toISOString())
         .eq('status', 'completed');
 
       if (error) throw error;
 
-      // Delete files from storage
-      for (const video of oldVideos) {
-        if (video.file_path) {
-          await this.deleteFile('video-files', video.file_path).catch(console.error);
-        }
-        if (video.thumbnail_path) {
-          await this.deleteFile('thumbnails', video.thumbnail_path).catch(console.error);
+      let deletedCount = 0;
+
+      for (const video of oldVideos || []) {
+        try {
+          if (!dryRun) {
+            // Delete from storage
+            await supabase.storage
+              .from('video-files')
+              .remove([`videos/${video.processing_id}/`]);
+            
+            await supabase.storage
+              .from('thumbnails')
+              .remove([`thumbnails/${video.processing_id}/`]);
+
+            // Delete database records
+            await supabase
+              .from('short_videos')
+              .delete()
+              .eq('video_processing_id', video.id);
+            
+            await supabase
+              .from('video_processing')
+              .delete()
+              .eq('id', video.id);
+          }
+          
+          deletedCount++;
+        } catch (fileError) {
+          console.warn(`Failed to cleanup video ${video.processing_id}:`, fileError);
         }
       }
 
-      console.log(`Cleaned up ${oldVideos.length} old video files`);
-      return oldVideos.length;
+      return deletedCount;
     } catch (error) {
-      console.error('Error cleaning up old files:', error);
+      console.error('Error during cleanup:', error);
       throw error;
     }
   }
+
+  // Connection management
+  async close() {
+    // Supabase client doesn't need explicit closing
+    console.log('Database connection closed');
+  }
 }
 
-// Initialize and test connection
-const supabaseDB = new SupabaseDB();
-
-// Test connection on startup
-supabaseDB.testConnection().then(success => {
-  if (!success) {
-    console.error('Failed to connect to Supabase - check your environment variables');
-    process.exit(1);
-  }
-});
-
-module.exports = supabaseDB;
+module.exports = new DatabaseService();
