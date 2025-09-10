@@ -1,4 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
+const fs = require('fs').promises;
+const path = require('path');
 
 class SupabaseDB {
   constructor() {
@@ -13,6 +15,11 @@ class SupabaseDB {
         auth: {
           autoRefreshToken: false,
           persistSession: false
+        },
+        global: {
+          headers: {
+            'Content-Type': 'application/json'
+          }
         }
       }
     );
@@ -36,6 +43,32 @@ class SupabaseDB {
     } catch (error) {
       console.error('Supabase connection error:', error);
       return false;
+    }
+  }
+
+  // Initialize storage buckets
+  async initializeStorage() {
+    const buckets = [
+      { name: 'video-files', public: true },
+      { name: 'processed-shorts', public: true },
+      { name: 'thumbnails', public: true },
+      { name: 'temp-files', public: false }
+    ];
+    
+    for (const bucket of buckets) {
+      try {
+        const { data, error } = await this.supabase.storage.createBucket(bucket.name, {
+          public: bucket.public
+        });
+        
+        if (error && !error.message.includes('already exists')) {
+          console.error(`Error creating bucket ${bucket.name}:`, error);
+        } else {
+          console.log(`Bucket ${bucket.name} ready`);
+        }
+      } catch (error) {
+        console.error(`Failed to initialize bucket ${bucket.name}:`, error);
+      }
     }
   }
 
@@ -73,10 +106,11 @@ class SupabaseDB {
           first_name,
           referral_code: referralCode,
           subscription_type: 'free',
-          videos_processed: 0,
-          shorts_generated: 0,
-          settings: {},
-          metadata: {}
+          daily_usage: 0,
+          total_usage: 0,
+          referred_users: 0,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
         })
         .select()
         .single();
@@ -122,33 +156,19 @@ class SupabaseDB {
       
       // Premium/Pro users have unlimited access if subscription is valid
       if (user.subscription_type === 'premium' || user.subscription_type === 'pro') {
-        if (user.subscription_expires_at && new Date() < new Date(user.subscription_expires_at)) {
+        if (user.subscription_expires && new Date() < new Date(user.subscription_expires)) {
           return true;
-        } else if (user.subscription_expires_at && new Date() >= new Date(user.subscription_expires_at)) {
+        } else if (user.subscription_expires && new Date() >= new Date(user.subscription_expires)) {
           // Subscription expired, downgrade to free
           await this.updateUser(telegramId, {
             subscription_type: 'free',
-            subscription_expires_at: null
+            subscription_expires: null
           });
         }
       }
       
-      // For free users, check daily usage (assuming 3 videos per day limit)
-      // Since there's no daily_usage field in the schema, we'll count today's videos
-      const today = new Date().toISOString().split('T')[0];
-      const { data: todayVideos, error } = await this.supabase
-        .from('video_processing')
-        .select('id')
-        .eq('telegram_id', telegramId)
-        .gte('created_at', `${today}T00:00:00Z`)
-        .eq('status', 'completed');
-
-      if (error) {
-        console.error('Error checking daily usage:', error);
-        return false;
-      }
-
-      return (todayVideos?.length || 0) < 3;
+      // Free users have daily limits
+      return user.daily_usage < 3;
     } catch (error) {
       console.error('Error checking service usage:', error);
       return false;
@@ -157,13 +177,24 @@ class SupabaseDB {
 
   async incrementUsage(telegramId) {
     try {
+      // First try using RPC function
+      const { data: rpcData, error: rpcError } = await this.supabase
+        .rpc('increment_usage', { user_telegram_id: telegramId });
+
+      if (!rpcError) {
+        return rpcData;
+      }
+
+      // Fallback to manual increment
+      console.log('RPC failed, using manual increment');
       const user = await this.getUser(telegramId);
       if (!user) throw new Error('User not found');
 
       const { data, error } = await this.supabase
         .from('users')
         .update({
-          videos_processed: user.videos_processed + 1,
+          daily_usage: user.daily_usage + 1,
+          total_usage: user.total_usage + 1,
           updated_at: new Date().toISOString()
         })
         .eq('telegram_id', telegramId)
@@ -186,7 +217,8 @@ class SupabaseDB {
       const { data, error } = await this.supabase
         .from('users')
         .update({
-          videos_processed: Math.max(user.videos_processed - 1, 0),
+          daily_usage: Math.max(user.daily_usage - 1, 0),
+          total_usage: Math.max(user.total_usage - 1, 0),
           updated_at: new Date().toISOString()
         })
         .eq('telegram_id', telegramId)
@@ -203,34 +235,40 @@ class SupabaseDB {
 
   async resetDailyUsage() {
     try {
-      // Since there's no daily_usage field, this is a no-op
-      // Daily usage is calculated dynamically from video_processing table
-      console.log('Daily usage reset completed (calculated dynamically)');
-      return [];
+      const { data, error } = await this.supabase
+        .from('users')
+        .update({ 
+          daily_usage: 0, 
+          updated_at: new Date().toISOString() 
+        })
+        .neq('daily_usage', 0)
+        .select();
+
+      if (error) throw error;
+      console.log(`Reset daily usage for ${data?.length || 0} users`);
+      return data;
     } catch (error) {
       console.error('Error resetting daily usage:', error);
       throw error;
     }
   }
 
-  // Video management - Fixed to use correct table names
+  // Video management
   async createVideo(videoData) {
     try {
       const { data, error } = await this.supabase
         .from('video_processing')
         .insert({
           processing_id: videoData.processing_id,
-          user_id: videoData.user_id, // Will need to get this from users table
+          user_id: videoData.user_id,
           telegram_id: videoData.telegram_id,
           original_url: videoData.video_url,
           platform: videoData.platform,
+          title: videoData.title || null,
           status: 'processing',
           subscription_type: videoData.subscription_type || 'free',
-          video_info: {},
-          shorts_segments: [],
-          total_shorts: 0,
-          shorts_generated: 0,
-          metadata: {}
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
         })
         .select()
         .single();
@@ -267,7 +305,7 @@ class SupabaseDB {
     try {
       const { data, error } = await this.supabase
         .from('video_processing')
-        .select('*')
+        .select('*, short_videos(*)')
         .eq('processing_id', processingId)
         .single();
 
@@ -279,27 +317,15 @@ class SupabaseDB {
     }
   }
 
-  // Shorts management - Fixed to use correct table name
+  // Shorts management
   async createShort(shortData) {
     try {
       const { data, error } = await this.supabase
         .from('short_videos')
         .insert({
-          short_id: shortData.short_id,
-          video_processing_id: shortData.video_id, // Maps to video_processing.id
-          user_id: shortData.user_id, // Will need user UUID
-          title: shortData.title,
-          description: shortData.description,
-          duration: shortData.duration,
-          quality: shortData.quality || '720p',
-          file_url: shortData.file_url,
-          thumbnail_url: shortData.thumbnail_url,
-          storage_path: shortData.storage_path,
-          thumbnail_path: shortData.thumbnail_path,
-          file_size_mb: shortData.file_size,
-          status: 'completed',
-          features_applied: shortData.features_applied || [],
-          metadata: shortData.metadata || {}
+          ...shortData,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
         })
         .select()
         .single();
@@ -312,6 +338,26 @@ class SupabaseDB {
     }
   }
 
+  async updateShort(shortId, updates) {
+    try {
+      const { data, error } = await this.supabase
+        .from('short_videos')
+        .update({
+          ...updates,
+          updated_at: new Date().toISOString()
+        })
+        .eq('short_id', shortId)
+        .select()
+        .single();
+
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      console.error('Error updating short:', error);
+      throw error;
+    }
+  }
+
   // File storage methods
   async uploadFile(bucket, filePath, fileBuffer, contentType) {
     try {
@@ -319,11 +365,13 @@ class SupabaseDB {
         .from(bucket)
         .upload(filePath, fileBuffer, {
           contentType,
-          upsert: true
+          upsert: true,
+          cacheControl: '3600'
         });
 
       if (error) throw error;
       
+      // Get public URL
       const { data: { publicUrl } } = this.supabase.storage
         .from(bucket)
         .getPublicUrl(filePath);
@@ -353,6 +401,20 @@ class SupabaseDB {
     }
   }
 
+  async createSignedUrl(bucket, filePath, expiresIn = 3600) {
+    try {
+      const { data, error } = await this.supabase.storage
+        .from(bucket)
+        .createSignedUrl(filePath, expiresIn);
+
+      if (error) throw error;
+      return data;
+    } catch (error) {
+      console.error('Error creating signed URL:', error);
+      throw error;
+    }
+  }
+
   // Usage logging
   async logUsage(logData) {
     try {
@@ -369,13 +431,15 @@ class SupabaseDB {
           error_message: logData.error_message || null,
           shorts_generated: logData.shorts_generated || 0,
           total_shorts: logData.total_shorts || 0,
-          file_size_mb: logData.file_size_mb || null
+          file_size_bytes: logData.file_size_bytes || null,
+          created_at: new Date().toISOString()
         });
 
       if (error) throw error;
       return data;
     } catch (error) {
       console.error('Error logging usage:', error);
+      // Don't throw error for logging failures
       return null;
     }
   }
@@ -383,17 +447,22 @@ class SupabaseDB {
   // Analytics methods
   async getStats() {
     try {
+      // Get user counts by subscription type
       const { data: userStats, error: userError } = await this.supabase
         .from('users')
         .select('subscription_type');
 
       if (userError) throw userError;
 
+      // Get total videos processed
       const { data: videoStats, error: videoError } = await this.supabase
         .from('video_processing')
         .select('status');
 
       if (videoError) throw videoError;
+
+      // Get storage usage
+      const storageUsage = await this.getStorageUsage();
 
       const stats = {
         users: {
@@ -407,7 +476,8 @@ class SupabaseDB {
           completed: videoStats.filter(v => v.status === 'completed').length,
           processing: videoStats.filter(v => v.status === 'processing').length,
           failed: videoStats.filter(v => v.status === 'failed').length
-        }
+        },
+        storage: storageUsage
       };
 
       return stats;
@@ -417,54 +487,91 @@ class SupabaseDB {
     }
   }
 
-  // Cleanup old files
-  async cleanupOldFiles(daysOld = 7, dryRun = false) {
+  async getStorageUsage() {
+    try {
+      const buckets = ['video-files', 'processed-shorts', 'thumbnails'];
+      let totalSize = 0;
+      let fileCount = 0;
+      
+      for (const bucket of buckets) {
+        try {
+          const { data, error } = await this.supabase.storage
+            .from(bucket)
+            .list();
+          
+          if (!error && data) {
+            fileCount += data.length;
+            // Calculate size (this is approximate as we'd need to get each file's metadata)
+            totalSize += data.length * 5 * 1024 * 1024; // Estimate 5MB per file
+          }
+        } catch (bucketError) {
+          console.error(`Error listing bucket ${bucket}:`, bucketError);
+        }
+      }
+      
+      return {
+        total_size_bytes: totalSize,
+        total_size_mb: (totalSize / 1024 / 1024).toFixed(2),
+        total_size_gb: (totalSize / 1024 / 1024 / 1024).toFixed(2),
+        file_count: fileCount
+      };
+    } catch (error) {
+      console.error('Error getting storage usage:', error);
+      return {
+        total_size_bytes: 0,
+        total_size_mb: 0,
+        total_size_gb: 0,
+        file_count: 0
+      };
+    }
+  }
+
+  // Cleanup old files (for maintenance)
+  async cleanupOldFiles(daysOld = 7, dryRun = true) {
     try {
       const cutoffDate = new Date();
       cutoffDate.setDate(cutoffDate.getDate() - daysOld);
 
-      const { data: oldFiles, error } = await this.supabase
-        .from('storage_files')
-        .select('file_path, bucket_name')
-        .lt('created_at', cutoffDate.toISOString());
+      const { data: oldVideos, error } = await this.supabase
+        .from('video_processing')
+        .select('file_path, thumbnail_path, storage_bucket')
+        .lt('created_at', cutoffDate.toISOString())
+        .eq('status', 'completed');
 
       if (error) throw error;
 
+      let deletedCount = 0;
+      
+      // Delete files from storage if not dry run
       if (!dryRun) {
-        for (const file of oldFiles) {
-          await this.deleteFile(file.bucket_name, file.file_path).catch(console.error);
+        for (const video of oldVideos) {
+          if (video.file_path && video.storage_bucket) {
+            await this.deleteFile(video.storage_bucket, video.file_path).catch(console.error);
+            deletedCount++;
+          }
+          if (video.thumbnail_path) {
+            await this.deleteFile('thumbnails', video.thumbnail_path).catch(console.error);
+            deletedCount++;
+          }
         }
       }
 
-      console.log(`${dryRun ? 'Would clean up' : 'Cleaned up'} ${oldFiles.length} old files`);
-      return oldFiles.length;
+      console.log(`Would clean up ${oldVideos.length} old video files (dry run: ${dryRun})`);
+      return {
+        dry_run: dryRun,
+        files_found: oldVideos.length,
+        files_deleted: dryRun ? 0 : deletedCount
+      };
     } catch (error) {
       console.error('Error cleaning up old files:', error);
       throw error;
     }
   }
 
-  // Add method to get storage usage
-  async getStorageUsage() {
-    try {
-      const { data: files, error } = await this.supabase
-        .from('storage_files')
-        .select('file_size_bytes');
-
-      if (error) throw error;
-
-      const totalBytes = files.reduce((sum, file) => sum + (file.file_size_bytes || 0), 0);
-      
-      return {
-        total_size_bytes: totalBytes,
-        total_size_mb: (totalBytes / 1024 / 1024).toFixed(2),
-        total_size_gb: (totalBytes / 1024 / 1024 / 1024).toFixed(2),
-        file_count: files.length
-      };
-    } catch (error) {
-      console.error('Error getting storage usage:', error);
-      return { total_size_gb: 0, file_count: 0 };
-    }
+  // Close connection (if needed)
+  async close() {
+    // Supabase JS client doesn't have a close method
+    return true;
   }
 }
 
@@ -473,12 +580,12 @@ const supabaseDB = new SupabaseDB();
 
 // Test connection on startup
 supabaseDB.testConnection().then(success => {
-  if (!success) {
+  if (success) {
+    console.log('Supabase connection successful');
+    // Initialize storage buckets
+    supabaseDB.initializeStorage().catch(console.error);
+  } else {
     console.error('Failed to connect to Supabase - check your environment variables');
-    // Don't exit in production, just log the error
-    if (process.env.NODE_ENV !== 'production') {
-      process.exit(1);
-    }
   }
 });
 
