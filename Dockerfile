@@ -1,6 +1,6 @@
 FROM n8nio/n8n
 
-# Install ffmpeg and other dependencies on Alpine
+# Install ffmpeg and other dependencies
 USER root
 RUN apk add --no-cache \
     ffmpeg \
