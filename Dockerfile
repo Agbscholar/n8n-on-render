@@ -10,8 +10,14 @@ RUN apk add --no-cache \
     g++ \
     && npm install -g node-gyp
 
-# Create directories for temporary files
+# Create directories and copy your script
 RUN mkdir -p /tmp/video-processing && chmod 777 /tmp/video-processing
+RUN mkdir -p /home/node/workflows
+
+# Copy your script file
+COPY business-bot/workflows/supabase-video-processing.js /home/node/workflows/
+COPY business-bot/package.json /home/node/
+RUN cd /home/node && npm install
 
 USER node
 
