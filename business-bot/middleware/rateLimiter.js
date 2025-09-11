@@ -114,6 +114,13 @@ class RateLimiter {
     }
   }
 
+  // NEW: Create Telegram middleware function
+  createTelegramMiddleware() {
+    return async (msg, bot, getUser) => {
+      return await this.checkTelegramRateLimit(msg, bot, getUser);
+    };
+  }
+
   createExpressMiddleware(customLimits = {}) {
     return (req, res, next) => {
       const identifier = req.ip || req.connection.remoteAddress;
@@ -204,8 +211,9 @@ class RateLimiter {
   }
 }
 
-// Change the export at the bottom of rateLimiter.js:
-module.exports = rateLimiter.createTelegramMiddleware();
-module.exports.rateLimiter = rateLimiter;
-module.exports.expressMiddleware = rateLimiter.createExpressMiddleware();
-module.exports.customExpressMiddleware = (options) => rateLimiter.createExpressMiddleware(options);
+// Create a single instance
+const rateLimiter = new RateLimiter();
+
+// Export both the instance and the middleware function
+module.exports = rateLimiter;
+module.exports.createTelegramMiddleware = rateLimiter.createTelegramMiddleware.bind(rateLimiter);
