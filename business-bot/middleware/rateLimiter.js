@@ -2,14 +2,15 @@ const logger = require('../utils/logger');
 
 class RateLimiter {
   constructor() {
-    this.requests = new Map();
+    this.requests = new Map(); // Store requests by user ID
     this.windowMs = 60 * 1000; // 1 minute window
     this.maxRequests = {
-      free: 10,
-      premium: 30,
-      pro: 60
+      free: 10,     // 10 requests per minute for free users
+      premium: 30,  // 30 requests per minute for premium users
+      pro: 60       // 60 requests per minute for pro users
     };
     
+    // Cleanup old entries every 5 minutes
     setInterval(() => this.cleanup(), 5 * 60 * 1000);
   }
 
@@ -18,6 +19,7 @@ class RateLimiter {
     let cleaned = 0;
     
     for (const [key, data] of this.requests.entries()) {
+      // Remove entries older than window
       data.requests = data.requests.filter(timestamp => 
         now - timestamp < this.windowMs
       );
@@ -37,17 +39,22 @@ class RateLimiter {
     const now = Date.now();
     const key = `user_${userId}`;
     
+    // Get or create user data
     let userData = this.requests.get(key);
     if (!userData) {
       userData = { requests: [], subscriptionType };
       this.requests.set(key, userData);
     }
 
+    // Update subscription type if it changed
     userData.subscriptionType = subscriptionType;
+
+    // Filter out old requests
     userData.requests = userData.requests.filter(timestamp => 
       now - timestamp < this.windowMs
     );
 
+    // Check if limit exceeded
     const limit = this.maxRequests[subscriptionType] || this.maxRequests.free;
     
     if (userData.requests.length >= limit) {
@@ -59,6 +66,7 @@ class RateLimiter {
       };
     }
 
+    // Add current request
     userData.requests.push(now);
 
     return {
@@ -69,66 +77,72 @@ class RateLimiter {
     };
   }
 
-  // Telegram middleware that accepts bot instance as parameter
-  async checkTelegramRateLimit(msg, bot, getUser) {
-    const userId = msg.from.id;
-    const chatId = msg.chat.id;
-    
-    try {
-      // Get user subscription type
-      const user = await getUser(userId);
-      const subscriptionType = user?.subscription_type || 'free';
+  // Middleware for Telegram bot commands
+  createTelegramMiddleware() {
+    return async (msg, metadata) => {
+      const userId = msg.from.id;
+      const chatId = msg.chat.id;
+      
+      try {
+        // Get user subscription type from database
+        const db = require('../utils/supabase');
+        const user = await db.getUser(userId);
+        const subscriptionType = user?.subscription_type || 'free';
 
-      const limitInfo = this.isRateLimited(userId, subscriptionType);
+        const limitInfo = this.isRateLimited(userId, subscriptionType);
 
-      if (limitInfo.limited) {
-        const resetIn = Math.ceil((limitInfo.resetTime - Date.now()) / 1000);
-        
-        const limitMessage = `Too many requests! You've exceeded your rate limit of ${limitInfo.limit} requests per minute. Please wait ${resetIn} seconds before trying again.`;
+        if (limitInfo.limited) {
+          const resetIn = Math.ceil((limitInfo.resetTime - Date.now()) / 1000);
+          
+          const limitMessage = `🚫 Too many requests!
 
-        await bot.sendMessage(chatId, limitMessage);
-        
-        logger.warn('Rate limit exceeded', {
+You've exceeded your rate limit of ${limitInfo.limit} requests per minute.
+
+Please wait ${resetIn} seconds before trying again.
+
+💎 Upgrade to Premium for higher limits!`;
+
+          const bot = require('../index').bot; // Get bot instance
+          await bot.sendMessage(chatId, limitMessage);
+          
+          logger.warn('Rate limit exceeded', {
+            userId,
+            subscriptionType,
+            limit: limitInfo.limit,
+            resetIn
+          });
+          
+          return false; // Block the request
+        }
+
+        logger.debug('Rate limit check passed', {
           userId,
           subscriptionType,
-          limit: limitInfo.limit,
-          resetIn
+          remaining: limitInfo.remaining
         });
-        
-        return false;
+
+        return true; // Allow the request
+      } catch (error) {
+        logger.error('Rate limiter error', { 
+          userId, 
+          error: error.message 
+        });
+        return true; // Allow request on error to avoid blocking users
       }
-
-      logger.debug('Rate limit check passed', {
-        userId,
-        subscriptionType,
-        remaining: limitInfo.remaining
-      });
-
-      return true;
-    } catch (error) {
-      logger.error('Rate limiter error', { 
-        userId, 
-        error: error.message 
-      });
-      return true; // Allow request on error
-    }
-  }
-
-  // NEW: Create Telegram middleware function
-  createTelegramMiddleware() {
-    return async (msg, bot, getUser) => {
-      return await this.checkTelegramRateLimit(msg, bot, getUser);
     };
   }
 
+  // Express middleware for HTTP endpoints
   createExpressMiddleware(customLimits = {}) {
     return (req, res, next) => {
+      // Use IP address for HTTP requests
       const identifier = req.ip || req.connection.remoteAddress;
       const key = `http_${identifier}`;
       
+      // Use custom limits or defaults
       const limits = {
         windowMs: customLimits.windowMs || this.windowMs,
-        maxRequests: customLimits.maxRequests || 100
+        maxRequests: customLimits.maxRequests || 100 // 100 requests per minute for HTTP
       };
 
       const now = Date.now();
@@ -139,6 +153,7 @@ class RateLimiter {
         this.requests.set(key, userData);
       }
 
+      // Filter old requests
       userData.requests = userData.requests.filter(timestamp => 
         now - timestamp < limits.windowMs
       );
@@ -166,6 +181,7 @@ class RateLimiter {
 
       userData.requests.push(now);
 
+      // Add rate limit headers
       res.set({
         'X-RateLimit-Limit': limits.maxRequests,
         'X-RateLimit-Remaining': limits.maxRequests - userData.requests.length,
@@ -176,6 +192,7 @@ class RateLimiter {
     };
   }
 
+  // Get current stats
   getStats() {
     const stats = {
       totalUsers: this.requests.size,
@@ -199,6 +216,7 @@ class RateLimiter {
     return stats;
   }
 
+  // Manual rate limit override (for admin purposes)
   clearUserLimits(userId) {
     const key = `user_${userId}`;
     const cleared = this.requests.delete(key);
@@ -209,11 +227,31 @@ class RateLimiter {
     
     return cleared;
   }
+
+  // Emergency rate limit adjustment
+  adjustLimits(subscriptionType, newLimit) {
+    if (!this.maxRequests.hasOwnProperty(subscriptionType)) {
+      throw new Error(`Invalid subscription type: ${subscriptionType}`);
+    }
+
+    const oldLimit = this.maxRequests[subscriptionType];
+    this.maxRequests[subscriptionType] = newLimit;
+
+    logger.info('Rate limits adjusted', {
+      subscriptionType,
+      oldLimit,
+      newLimit
+    });
+
+    return { subscriptionType, oldLimit, newLimit };
+  }
 }
 
-// Create a single instance
+// Create singleton instance
 const rateLimiter = new RateLimiter();
 
-// Export both the instance and the middleware function
-module.exports = rateLimiter;
-module.exports.createTelegramMiddleware = rateLimiter.createTelegramMiddleware.bind(rateLimiter);
+// Export both the instance and middleware
+module.exports = rateLimiter.createTelegramMiddleware();
+module.exports.rateLimiter = rateLimiter;
+module.exports.expressMiddleware = rateLimiter.createExpressMiddleware();
+module.exports.customExpressMiddleware = (options) => rateLimiter.createExpressMiddleware(options);
