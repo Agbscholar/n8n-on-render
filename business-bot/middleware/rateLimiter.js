@@ -1,5 +1,25 @@
 const logger = require('../utils/logger');
 
+// Add the missing detectPlatform function with proper error handling
+async function detectPlatform(url) {
+  try {
+    // Your platform detection logic here
+    // For example:
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      return 'youtube';
+    } else if (url.includes('tiktok.com')) {
+      return 'tiktok';
+    } else if (url.includes('instagram.com')) {
+      return 'instagram';
+    } else {
+      return 'unknown';
+    }
+  } catch (error) {
+    logger.error('Error detecting platform:', error);
+    throw error;
+  }
+}
+
 class RateLimiter {
   constructor() {
     this.requests = new Map(); // Store requests by user ID
@@ -36,6 +56,17 @@ class RateLimiter {
   }
 
   isRateLimited(userId, subscriptionType = 'free') {
+    // Ensure userId is not null or undefined
+    if (!userId) {
+      logger.error('Rate limiter called with null/undefined userId');
+      return {
+        limited: true,
+        limit: 0,
+        remaining: 0,
+        resetTime: Date.now() + this.windowMs
+      };
+    }
+    
     const now = Date.now();
     const key = `user_${userId}`;
     
@@ -80,6 +111,12 @@ class RateLimiter {
   // Middleware for Telegram bot commands
   createTelegramMiddleware() {
     return async (msg, metadata) => {
+      // Ensure we have a valid user ID
+      if (!msg || !msg.from || !msg.from.id) {
+        logger.error('Invalid message object in rate limiter middleware');
+        return false; // Block the request
+      }
+      
       const userId = msg.from.id;
       const chatId = msg.chat.id;
       
@@ -218,6 +255,11 @@ Please wait ${resetIn} seconds before trying again.
 
   // Manual rate limit override (for admin purposes)
   clearUserLimits(userId) {
+    if (!userId) {
+      logger.error('Attempted to clear limits with null userId');
+      return false;
+    }
+    
     const key = `user_${userId}`;
     const cleared = this.requests.delete(key);
     
@@ -250,8 +292,11 @@ Please wait ${resetIn} seconds before trying again.
 // Create singleton instance
 const rateLimiter = new RateLimiter();
 
-// Export both the instance and middleware
-module.exports = rateLimiter.createTelegramMiddleware();
-module.exports.rateLimiter = rateLimiter;
-module.exports.expressMiddleware = rateLimiter.createExpressMiddleware();
-module.exports.customExpressMiddleware = (options) => rateLimiter.createExpressMiddleware(options);
+// Export correctly
+module.exports = {
+  telegramMiddleware: rateLimiter.createTelegramMiddleware(),
+  expressMiddleware: rateLimiter.createExpressMiddleware(),
+  customExpressMiddleware: (options) => rateLimiter.createExpressMiddleware(options),
+  rateLimiter: rateLimiter,
+  detectPlatform: detectPlatform // Export the missing function
+};
