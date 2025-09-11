@@ -1,4 +1,3 @@
-rateLimiter.js
 const logger = require('../utils/logger');
 
 class RateLimiter {
@@ -249,10 +248,16 @@ Please wait ${resetIn} seconds before trying again.
 }
 
 // Create singleton instance
-const rateLimiter = new RateLimiter();
+const rateLimiterInstance = new RateLimiter();
 
-// Export both the instance and middleware
-module.exports = rateLimiter.createTelegramMiddleware();
-module.exports.rateLimiter = rateLimiter;
-module.exports.expressMiddleware = rateLimiter.createExpressMiddleware();
-module.exports.customExpressMiddleware = (options) => rateLimiter.createExpressMiddleware(options);
+// FIXED: Export the correct structure
+module.exports = {
+  // Default export is the middleware function
+  middleware: rateLimiterInstance.createTelegramMiddleware(),
+  // Export the instance for other uses
+  instance: rateLimiterInstance,
+  // Export express middleware
+  expressMiddleware: rateLimiterInstance.createExpressMiddleware(),
+  // Export custom express middleware creator
+  customExpressMiddleware: (options) => rateLimiterInstance.createExpressMiddleware(options)
+};

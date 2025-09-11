@@ -10,9 +10,13 @@ const cron = require('cron');
 const { createClient } = require('@supabase/supabase-js');
 
 // Import utilities
-const logger = require('./utils/logger');
-const rateLimiter = require('./middleware/rateLimiter');
-const validator = require('./utils/validator');
+const db = require('./utils/supabase');
+const logger = require('./utils/logger'); // Enhanced logging utility
+const rateLimiterModule = require('./middleware/rateLimiter'); // FIXED: Import the module object
+const validator = require('./utils/validator'); // Input validation
+
+// FIXED: Extract the middleware function from the module
+const rateLimiter = rateLimiterModule.middleware;
 
 // Initialize Express app and Telegram bot
 const app = express();
@@ -25,8 +29,12 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
 });
 
 // Enhanced middleware setup
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// FIXED: Use express middleware correctly
+app.use(rateLimiterModule.expressMiddleware);
+
 
 // Enhanced request logging with correlation IDs
 app.use((req, res, next) => {
