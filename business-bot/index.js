@@ -1030,9 +1030,10 @@ Contact @Osezblessed to upgrade!`;
   bot.sendMessage(msg.chat.id, upgradeMessage, {reply_markup: keyboard});
 });
 
-// Enhanced video URL processing with proper queue management
+// FIXED: Enhanced video URL processing with proper queue management and duplicate prevention
 bot.on('message', async (msg) => {
-  if (msg.text && msg.text.startsWith('/')) return;
+  // Skip if it's a command or not a text message
+  if (!msg.text || msg.text.startsWith('/')) return;
   
   const videoUrlPattern = /(youtube\.com|youtu\.be|tiktok\.com|vm\.tiktok\.com|instagram\.com|twitter\.com|x\.com)/i;
   
@@ -1040,9 +1041,23 @@ bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const telegramId = msg.from.id;
     const videoUrl = msg.text.trim();
+    const messageId = msg.message_id;
     let processingId = null;
     
-    logger.info('Processing video request', { telegramId, videoUrl });
+    // FIXED: Prevent duplicate processing using message ID
+    const processingKey = `processing_${telegramId}_${messageId}`;
+    if (global.activeProcessing && global.activeProcessing.has(processingKey)) {
+      logger.warn('Duplicate message processing prevented', { telegramId, messageId });
+      return;
+    }
+    
+    // Initialize global processing tracker
+    if (!global.activeProcessing) {
+      global.activeProcessing = new Set();
+    }
+    global.activeProcessing.add(processingKey);
+    
+    logger.info('Processing video request', { telegramId, videoUrl, messageId });
     
     try {
       // Input validation
@@ -1104,11 +1119,12 @@ Current global load: ${queueStatus.globalProcessing[user.subscription_type]}/${p
       
       await bot.sendMessage(chatId, processingMessages[user.subscription_type]);
       
-      const videoRecord = await createVideo({
+      // FIXED: Create video record with correct data structure
+      const videoRecord = await db.createVideo({
         processing_id: processingId,
-        telegram_id: telegramId,
+        telegram_id: telegramId, // FIXED: Use telegram_id instead of user_id
         video_url: videoUrl,
-        platform: detectPlatform(videoUrl)
+        platform: detectPlatform(videoUrl) // FIXED: Remove .catch() since it returns string
       });
       
       await userService.updateUsage(telegramId);
@@ -1169,12 +1185,12 @@ Current global load: ${queueStatus.globalProcessing[user.subscription_type]}/${p
         throw lastError;
       }
       
-      await logUsage({
+      await db.logUsage({
         telegram_id: telegramId,
         video_id: videoRecord.id,
         processing_id: processingId,
         action: 'video_processing_started',
-        platform: detectPlatform(videoUrl),
+        platform: detectPlatform(videoUrl), // FIXED: Remove .catch()
         success: true
       });
       
@@ -1195,14 +1211,22 @@ Error code: ${error.response?.status || 'NETWORK_ERROR'}`);
         processingQueue.finishProcessing(processingId);
       }
       
-      await logUsage({
+      await db.logUsage({
         telegram_id: telegramId,
         processing_id: processingId || null,
         action: 'video_processing_failed',
-        platform: detectPlatform(videoUrl).catch(() => 'Unknown'),
+        platform: detectPlatform(videoUrl), // FIXED: Remove .catch()
         success: false,
         error_message: error.message
       });
+    } finally {
+      // FIXED: Always cleanup processing tracker
+      global.activeProcessing.delete(processingKey);
+      
+      // Auto-cleanup after 10 minutes to prevent memory leaks
+      setTimeout(() => {
+        global.activeProcessing?.delete(processingKey);
+      }, 10 * 60 * 1000);
     }
   }
 });
