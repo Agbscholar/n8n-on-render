@@ -204,4 +204,8 @@ class RateLimiter {
   }
 }
 
-module.exports = new RateLimiter();
+// Change the export at the bottom of rateLimiter.js:
+module.exports = rateLimiter.createTelegramMiddleware();
+module.exports.rateLimiter = rateLimiter;
+module.exports.expressMiddleware = rateLimiter.createExpressMiddleware();
+module.exports.customExpressMiddleware = (options) => rateLimiter.createExpressMiddleware(options);
