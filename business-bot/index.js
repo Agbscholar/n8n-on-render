@@ -33,7 +33,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(rateLimitMiddleware); // HTTP rate limiting
 
-// Multer for file uploads (used if n8n isn't handling files)
+// Multer for file uploads
 const upload = multer({
   dest: './temp/',
   limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
@@ -66,7 +66,7 @@ const telegramRateLimit = new Map(); // Key: telegram_id, Value: { count, resetT
 // Video processing queue
 class VideoProcessingQueue {
   constructor() {
-    this.userProcessing processed = new Map();
+    this.userProcessing = new Map(); // FIXED: Removed erroneous 'processed'
     this.processing = new Map();
     this.maxPerUser = { free: 1, premium: 3, pro: 5 };
     this.globalProcessing = { free: 0, premium: 0, pro: 0 };
