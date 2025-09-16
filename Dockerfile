@@ -10,11 +10,13 @@ RUN apk add --no-cache \
     python3 \
     make \
     g++ \
-    && npm install -g node-gyp
+    && npm install -g node-gyp n8n
 
 # Create directories with appropriate permissions
 RUN mkdir -p /tmp/video-processing && chmod 777 /tmp/video-processing
 RUN mkdir -p /home/node/workflows && chown node:node /home/node/workflows
+RUN mkdir -p /home/node/.n8n && chown node:node /home/node/.n8n
+RUN touch /home/node/.n8n/config && chmod 600 /home/node/.n8n/config
 
 # Copy workflow and package files
 COPY business-bot/workflows/supabase-video-processing.js /home/node/workflows/
@@ -29,6 +31,7 @@ USER node
 # Set environment variables (will be overridden by Render)
 ENV N8N_PORT=5678
 ENV WEBHOOK_URL=https://n8n-on-render-wf30.onrender.com
+ENV N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
 
 # Expose port
 EXPOSE 5678
