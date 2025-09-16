@@ -1,4 +1,4 @@
-FROM n8nio/n8n:latest
+FROM n8nio/n8n:1.60.1
 
 # Switch to root user for package installation
 USER root
@@ -10,9 +10,7 @@ RUN apk add --no-cache \
     python3 \
     make \
     g++ \
-    && npm install -g node-gyp n8n \
-    && npm config set prefix /home/node/.npm-global \
-    && chown -R node:node /home/node/.npm-global
+    && npm install -g node-gyp
 
 # Create directories with appropriate permissions
 RUN mkdir -p /tmp/video-processing && chmod 777 /tmp/video-processing
@@ -37,7 +35,9 @@ ENV N8N_PORT=5678
 ENV PORT=5678
 ENV WEBHOOK_URL=https://n8n-on-render-wf30.onrender.com
 ENV N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-ENV PATH=/home/node/.npm-global/bin:$PATH
+ENV DB_SQLITE_POOL_SIZE=10
+ENV N8N_RUNNERS_ENABLED=true
+ENV N8N_BLOCK_ENV_ACCESS_IN_NODE=false
 
 # Expose port
 EXPOSE 5678
