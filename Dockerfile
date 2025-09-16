@@ -16,7 +16,6 @@ RUN apk add --no-cache \
 RUN mkdir -p /tmp/video-processing && chmod 777 /tmp/video-processing
 RUN mkdir -p /home/node/workflows && chown node:node /home/node/workflows
 RUN mkdir -p /home/node/.n8n && chown -R node:node /home/node/.n8n
-RUN echo '{"encryptionKey": "default"}' > /home/node/.n8n/config && chown node:node /home/node/.n8n/config && chmod 600 /home/node/.n8n/config
 
 # Copy workflow and package files
 COPY business-bot/workflows/supabase-video-processing.js /home/node/workflows/
