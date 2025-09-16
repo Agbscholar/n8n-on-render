@@ -15,10 +15,10 @@ const { middleware: rateLimitMiddleware } = require('./middleware/rateLimiter');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// Initialize Telegram Bot with Webhook (preferred for production)
+// Initialize Telegram Bot with Webhook
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
-  webHook: true, // Use webhook mode to avoid 409 conflicts
-  polling: false // Disable polling
+  webHook: true, // Use webhook to avoid 409 conflicts
+  polling: false
 });
 
 // Initialize Supabase
@@ -31,9 +31,9 @@ const supabase = createClient(
 // Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(rateLimitMiddleware); // Express rate limiting for HTTP requests
+app.use(rateLimitMiddleware); // HTTP rate limiting
 
-// Multer for file uploads
+// Multer for file uploads (used if n8n isn't handling files)
 const upload = multer({
   dest: './temp/',
   limits: { fileSize: 200 * 1024 * 1024 }, // 200MB
@@ -60,13 +60,13 @@ app.post(`/bot${PORT}`, (req, res) => {
   res.sendStatus(200);
 });
 
-// Telegram-specific rate limiting (in-memory)
+// Telegram rate limiting (in-memory)
 const telegramRateLimit = new Map(); // Key: telegram_id, Value: { count, resetTime }
 
 // Video processing queue
 class VideoProcessingQueue {
   constructor() {
-    this.userProcessing = new Map();
+    this.userProcessing processed = new Map();
     this.processing = new Map();
     this.maxPerUser = { free: 1, premium: 3, pro: 5 };
     this.globalProcessing = { free: 0, premium: 0, pro: 0 };
