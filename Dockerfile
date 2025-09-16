@@ -10,7 +10,9 @@ RUN apk add --no-cache \
     python3 \
     make \
     g++ \
-    && npm install -g node-gyp n8n
+    && npm install -g node-gyp n8n \
+    && npm config set prefix /home/node/.npm-global \
+    && chown -R node:node /home/node/.npm-global
 
 # Create directories with appropriate permissions
 RUN mkdir -p /tmp/video-processing && chmod 777 /tmp/video-processing
@@ -35,6 +37,7 @@ ENV N8N_PORT=5678
 ENV PORT=5678
 ENV WEBHOOK_URL=https://n8n-on-render-wf30.onrender.com
 ENV N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+ENV PATH=/home/node/.npm-global/bin:$PATH
 
 # Expose port
 EXPOSE 5678
