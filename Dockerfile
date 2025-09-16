@@ -1,7 +1,6 @@
-FROM n8nio/n8n
+FROM n8nio/n8n:latest
 
-# Install ffmpeg and other dependencies
-USER root
+# Install dependencies for video processing
 RUN apk add --no-cache \
     ffmpeg \
     curl \
@@ -10,17 +9,23 @@ RUN apk add --no-cache \
     g++ \
     && npm install -g node-gyp
 
-# Create directories and copy your script
+# Create directories
 RUN mkdir -p /tmp/video-processing && chmod 777 /tmp/video-processing
 RUN mkdir -p /home/node/workflows
 
 # Copy your script file
 COPY business-bot/workflows/supabase-video-processing.js /home/node/workflows/
 COPY business-bot/package.json /home/node/
+
+# Install Node.js dependencies
 RUN cd /home/node && npm install
 
-USER node
+# Set environment variables (will be overridden by Render)
+ENV N8N_PORT=5678
+ENV WEBHOOK_URL=https://n8n-on-render-wf30.onrender.com
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:5678/health || exit 1
+# Expose port
+EXPOSE 5678
+
+# Start n8n
+CMD ["n8n", "start"]
