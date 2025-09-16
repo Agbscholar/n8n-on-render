@@ -10,11 +10,16 @@ const { createClient } = require('@supabase/supabase-js');
 const { v4: uuidv4 } = require('uuid');
 const logger = require('./utils/logger');
 const validator = require('./utils/validator');
-const rateLimiter = require('./middleware/rateLimiter').middleware;
+const { middleware: rateLimitMiddleware } = require('./middleware/rateLimiter');
 
 const app = express();
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 const PORT = process.env.PORT || 10000;
+
+// Initialize Telegram Bot with Webhook (preferred for production)
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
+  webHook: true, // Use webhook mode to avoid 409 conflicts
+  polling: false // Disable polling
+});
 
 // Initialize Supabase
 const supabase = createClient(
@@ -26,7 +31,7 @@ const supabase = createClient(
 // Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(rateLimiter);
+app.use(rateLimitMiddleware); // Express rate limiting for HTTP requests
 
 // Multer for file uploads
 const upload = multer({
@@ -48,6 +53,15 @@ app.use((req, res, next) => {
   logger.info(`${req.method} ${req.path}`, { correlationId: req.correlationId, ip: req.ip });
   next();
 });
+
+// Telegram webhook route
+app.post(`/bot${PORT}`, (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+// Telegram-specific rate limiting (in-memory)
+const telegramRateLimit = new Map(); // Key: telegram_id, Value: { count, resetTime }
 
 // Video processing queue
 class VideoProcessingQueue {
@@ -253,7 +267,11 @@ async function sendAdminAlert(message, error = null) {
   const adminChatId = process.env.ADMIN_CHAT_ID;
   if (adminChatId) {
     const alertMessage = `🚨 ADMIN ALERT\n\n${message}\n\nTime: ${new Date().toISOString()}${error ? `\n\nError: ${error.message}` : ''}`;
-    await bot.sendMessage(adminChatId, alertMessage);
+    try {
+      await bot.sendMessage(adminChatId, alertMessage);
+    } catch (err) {
+      logger.error('Failed to send admin alert', { error: err.message });
+    }
   }
 }
 
@@ -272,6 +290,20 @@ bot.on('video', async (msg) => {
   const processingId = `proc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
   try {
+    // Telegram rate limiting
+    const now = Date.now();
+    const userLimit = telegramRateLimit.get(telegramId) || { count: 0, resetTime: now + 60 * 60 * 1000 };
+    if (now > userLimit.resetTime) {
+      userLimit.count = 0;
+      userLimit.resetTime = now + 60 * 60 * 1000;
+    }
+    if (userLimit.count >= 5) {
+      await bot.sendMessage(chatId, 'Rate limit: Too many videos. Please wait 1 hour.');
+      return;
+    }
+    userLimit.count++;
+    telegramRateLimit.set(telegramId, userLimit);
+
     // Check user eligibility
     const user = await userService.initUser(telegramId, msg.from);
     if (!await userService.canProcessVideo(telegramId)) {
@@ -294,7 +326,7 @@ bot.on('video', async (msg) => {
     const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
     const tempPath = `./temp/${processingId}_${path.basename(file.file_path)}`;
     await fs.mkdir('./temp', { recursive: true });
-    
+
     // Download video
     const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
     await fs.writeFile(tempPath, response.data);
@@ -351,7 +383,7 @@ bot.on('video', async (msg) => {
 // Webhook callback
 app.post('/webhook/n8n-callback', async (req, res) => {
   const { processing_id, telegram_id, chat_id, status, shorts_results, thumbnail_url, error } = req.body;
-  
+
   try {
     if (status === 'completed') {
       const message = `Video processing completed (ID: ${processing_id}). Generated ${shorts_results.length} shorts.\nThumbnail: ${thumbnail_url}`;
@@ -377,8 +409,11 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
-// Start server
+// Start server and set webhook
 app.listen(PORT, () => {
-  logger.info(`Business bot running on port ${PORT}`);
+  logger.info(`Server running on port ${PORT}`);
+  bot.setWebHook(`${process.env.RENDER_EXTERNAL_URL}/bot${PORT}`)
+    .then(() => logger.info('Webhook set successfully'))
+    .catch(err => logger.error('Failed to set webhook', { error: err.message }));
+  dailyResetJob.start();
 });
-dailyResetJob.start();
