@@ -8,7 +8,6 @@ const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const { CronJob } = require('cron');
 
-app.set('trust proxy', true);
 // Environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL;
@@ -29,6 +28,8 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 const upload = multer({ storage: multer.memoryStorage() });
+
+app.set('trust proxy', true);
 
 // Rate limiting for webhook endpoint
 const limiter = rateLimit({
