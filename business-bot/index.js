@@ -8,6 +8,7 @@ const { v4: uuidv4 } = require('uuid');
 const multer = require('multer');
 const { CronJob } = require('cron');
 
+app.set('trust proxy', true);
 // Environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL;
@@ -61,7 +62,7 @@ bot.onText(/\/start/, async (msg) => {
       .insert({
         telegram_id: telegramId,
         subscription_type: 'free',
-        subscription_end: null,
+        subscription_expires_at: null,
         created_at: new Date().toISOString(),
       });
 
@@ -71,7 +72,7 @@ bot.onText(/\/start/, async (msg) => {
       return;
     }
 
-    user = { telegram_id: telegramId, subscription_type: 'free', subscription_end: null };
+    user = { telegram_id: telegramId, subscription_type: 'free', subscription_expires_at: null };
   }
 
   await bot.sendMessage(
@@ -96,7 +97,7 @@ bot.on('video', async (msg) => {
   // Check user in Supabase
   const { data: user, error } = await supabase
     .from('users')
-    .select('subscription_type, subscription_end')
+    .select('subscription_type, subscription_expires_at')
     .eq('telegram_id', telegramId)
     .single();
 
@@ -112,12 +113,12 @@ bot.on('video', async (msg) => {
   }
 
   // Check subscription status
-  if (user.subscription_type === 'premium' && user.subscription_end) {
-    const subscriptionEnd = new Date(user.subscription_end);
+  if (user.subscription_type === 'premium' && user.subscription_expires_at) {
+    const subscriptionEnd = new Date(user.subscription_expires_at);
     if (subscriptionEnd < new Date()) {
       await supabase
         .from('users')
-        .update({ subscription_type: 'free', subscription_end: null })
+        .update({ subscription_type: 'free', subscription_expires_at: null })
         .eq('telegram_id', telegramId);
       user.subscription_type = 'free';
     }
@@ -212,17 +213,17 @@ const job = new CronJob('0 0 * * *', async () => {
   try {
     const { data: users, error } = await supabase
       .from('users')
-      .select('telegram_id, subscription_end, subscription_type')
+      .select('telegram_id, subscription_expires_at, subscription_type')
       .eq('subscription_type', 'premium');
 
     if (error) throw error;
 
     const now = new Date();
     for (const user of users) {
-      if (user.subscription_end && new Date(user.subscription_end) < now) {
+      if (user.subscription_expires_at && new Date(user.subscription_expires_at) < now) {
         await supabase
           .from('users')
-          .update({ subscription_type: 'free', subscription_end: null })
+          .update({ subscription_type: 'free', subscription_expires_at: null })
           .eq('telegram_id', user.telegram_id);
         await bot.sendMessage(
           user.telegram_id,
