@@ -3,9 +3,7 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
-const FormData = require('form-data');
 const { v4: uuidv4 } = require('uuid');
-const multer = require('multer');
 const { CronJob } = require('cron');
 
 // Environment variables
@@ -27,14 +25,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-const upload = multer({ storage: multer.memoryStorage() });
-
-app.set('trust proxy', true);
+app.set('trust proxy', 1); // Correct setting for Render
 
 // Rate limiting for webhook endpoint
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // Limit to 100 requests per window
+  standardHeaders: true,
+  legacyHeaders: false,
 });
 app.use('/webhook', limiter);
 
@@ -132,21 +130,22 @@ bot.on('video', async (msg) => {
   try {
     await bot.sendMessage(chatId, 'Video accepted for processing. Please wait...');
 
-    const formData = new FormData();
-    formData.append('file_id', fileId);
-    formData.append('processing_id', processingId);
-    formData.append('telegram_id', telegramId);
-    formData.append('chat_id', chatId.toString());
-    formData.append('subscription_type', user.subscription_type);
-    formData.append('callback_url', `${RENDER_EXTERNAL_URL}/webhook/n8n-callback`);
+    const payload = {
+      file_id: fileId,
+      processing_id: processingId,
+      telegram_id: telegramId,
+      chat_id: chatId.toString(),
+      subscription_type: user.subscription_type,
+      callback_url: `${RENDER_EXTERNAL_URL}/webhook/n8n-callback`,
+    };
 
     const processorResponse = await axios.post(
       'https://n8n-on-render-wf30.onrender.com/webhook/video-processing',
-      formData,
+      payload,
       {
         headers: {
-          ...formData.getHeaders(),
-          Authorization: `Bearer ${N8N_WEBHOOK_SECRET}`,
+          'Authorization': `Bearer ${N8N_WEBHOOK_SECRET}`,
+          'Content-Type': 'application/json',
         },
         timeout: 30000,
       }
@@ -158,22 +157,14 @@ bot.on('video', async (msg) => {
       throw new Error(processorResponse.data.error || 'Processing initiation failed.');
     }
   } catch (error) {
-    console.error('Error sending to n8n:', error.message);
+    console.error('Error sending to n8n:', error.message, error.response?.status, error.response?.data);
     await bot.sendMessage(chatId, 'Failed to initiate video processing. Please try again.');
   }
 });
 
 // Express endpoint for n8n callback
 app.post('/webhook/n8n-callback', async (req, res) => {
-  const {
-    processing_id,
-    telegram_id,
-    chat_id,
-    status,
-    shorts_results,
-    thumbnail_url,
-    error,
-  } = req.body;
+  const { processing_id, telegram_id, chat_id, status, shorts_results, thumbnail_url, error } = req.body;
 
   if (!processing_id || !telegram_id || !chat_id) {
     console.error('Invalid callback data:', req.body);
@@ -185,7 +176,7 @@ app.post('/webhook/n8n-callback', async (req, res) => {
       // Send thumbnail
       await bot.sendPhoto(chat_id, thumbnail_url, { caption: 'Processing complete! Here is your thumbnail.' });
 
-      // Send shorts (assuming shorts_results contains URLs)
+      // Send shorts
       for (const short of shorts_results) {
         await bot.sendVideo(chat_id, short.url, { caption: 'Here is one of your processed shorts.' });
       }
@@ -209,7 +200,7 @@ app.post(webhookPath, (req, res) => {
   res.status(200).send('OK');
 });
 
-// Cron job to check subscription expirations (runs daily at midnight)
+// Cron job to check subscription expirations
 const job = new CronJob('0 0 * * *', async () => {
   try {
     const { data: users, error } = await supabase
