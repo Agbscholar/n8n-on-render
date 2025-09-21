@@ -58,14 +58,14 @@
     "n8n",
     "automation"
   ],
-  "author": "Your Name",
+  "author": "Blessed Osezua",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/video-shorts-bot.git"
+    "url": "https://github.com/Agbscholar/video-shorts-bot.git"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/video-shorts-bot/issues"
+    "url": "https://github.com/Agbscholar/video-shorts-bot/issues"
   },
-  "homepage": "https://github.com/yourusername/video-shorts-bot#readme"
+  "homepage": "https://github.com/Agbscholar/video-shorts-bot#readme"
 }
