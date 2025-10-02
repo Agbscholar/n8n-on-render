@@ -989,7 +989,10 @@ ${user.subscription_type === 'free' ? '\nUpgrade to Premium for higher limits!' 
           n8nPayload,
           {
             timeout: 30000,
-            headers: { 'Content-Type': 'application/json' }
+			headers: { 
+			'Content-Type': 'application/json',
+			'Authorization': `Bearer ${process.env.N8N_WEBHOOK_SECRET}` 
+			}
           }
         );
         
