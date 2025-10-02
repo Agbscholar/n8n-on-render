@@ -318,6 +318,10 @@ class VideoProcessingQueue {
       globalCount: this.globalProcessing[subscriptionType]
     });
   }
+  
+  function ensureString(value) {
+  return value != null ? String(value) : '';
+}
 
   finishProcessing(processingId) {
     const processInfo = this.processing.get(processingId);
@@ -769,8 +773,8 @@ ${user.subscription_type === 'free' ? '\nUpgrade to Premium for higher limits!' 
       await userService.updateUsage(telegramId);
       
       const n8nPayload = {
-        telegram_id: telegramId,
-        chat_id: chatId,
+        telegram_id: ensureString(telegramId),
+  chat_id: ensureString(chatId),
         video_url: videoUrl,
         user_name: user.first_name,
         subscription_type: user.subscription_type,
