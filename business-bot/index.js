@@ -318,10 +318,6 @@ class VideoProcessingQueue {
       globalCount: this.globalProcessing[subscriptionType]
     });
   }
-  
-  function ensureString(value) {
-  return value != null ? String(value) : '';
-}
 
   finishProcessing(processingId) {
     const processInfo = this.processing.get(processingId);
@@ -773,8 +769,8 @@ ${user.subscription_type === 'free' ? '\nUpgrade to Premium for higher limits!' 
       await userService.updateUsage(telegramId);
       
       const n8nPayload = {
-        telegram_id: ensureString(telegramId),
-  chat_id: ensureString(chatId),
+       telegram_id: String(telegramId),  // Convert to string
+  chat_id: String(chatId),          // Convert to string
         video_url: videoUrl,
         user_name: user.first_name,
         subscription_type: user.subscription_type,
@@ -968,8 +964,8 @@ ${user.subscription_type === 'free' ? '\nUpgrade to Premium for higher limits!' 
     await userService.updateUsage(telegramId);
     
     const n8nPayload = {
-      telegram_id: telegramId,
-      chat_id: chatId,
+     telegram_id: String(telegramId),  // Convert to string
+  chat_id: String(chatId),          // Convert to string
       file_id: file.file_id,
       file_name: file.file_name,
       file_size: file.file_size,
@@ -996,10 +992,10 @@ ${user.subscription_type === 'free' ? '\nUpgrade to Premium for higher limits!' 
           n8nPayload,
           {
             timeout: 30000,
-			headers: { 
-			'Content-Type': 'application/json',
-			'Authorization': `Bearer ${process.env.N8N_WEBHOOK_SECRET}` 
-			}
+            headers: { 
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.N8N_WEBHOOK_SECRET}`
+    }
           }
         );
         
